@@ -1,5 +1,5 @@
 {
-  "name": "convox-deploy-debug-test-app",
+  "name": "convox-v3-deploy-debug-test-app",
   "version": "1.0.0",
   "private": true,
   "dependencies": {

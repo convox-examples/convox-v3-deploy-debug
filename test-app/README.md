@@ -1,6 +1,6 @@
-# convox-deploy-debug test app
+# convox-v3-deploy-debug test app
 
-Sample two-service app for validating the `convox-deploy-debug` tool. One service is healthy, one deliberately crashes on startup. This simulates the most common deploy failure pattern where `convox logs` shows nothing because health checks never pass.
+Sample two-service app for validating the `convox-v3-deploy-debug` tool. One service is healthy, one deliberately crashes on startup. This simulates the most common deploy failure pattern where `convox logs` shows nothing because health checks never pass.
 
 ## Services
 
@@ -34,25 +34,25 @@ Run from the repo root (one directory up from `test-app/`):
 
 ```bash
 # Easiest: interactive guided mode (picks rack, configures kubectl, picks app)
-./convox-deploy-debug
+./convox-v3-deploy-debug
 
 # Full terminal output with service discovery
-./convox-deploy-debug -r <rack> -a test-debug -y test-app/convox.yml
+./convox-v3-deploy-debug -r <rack> -a test-debug -y test-app/convox.yml
 
 # Quick triage with summary mode
-./convox-deploy-debug -r <rack> -a test-debug -o summary
+./convox-v3-deploy-debug -r <rack> -a test-debug -o summary
 
 # JSON output for scripting
-./convox-deploy-debug -r <rack> -a test-debug -o json | jq .
+./convox-v3-deploy-debug -r <rack> -a test-debug -o json | jq .
 
 # Target just the broken service
-./convox-deploy-debug -r <rack> -a test-debug -s worker
+./convox-v3-deploy-debug -r <rack> -a test-debug -s worker
 
 # Include all pods (even the healthy web service)
-./convox-deploy-debug -r <rack> -a test-debug --all
+./convox-v3-deploy-debug -r <rack> -a test-debug --all
 
 # Include full pod describe output
-./convox-deploy-debug -r <rack> -a test-debug --describe
+./convox-v3-deploy-debug -r <rack> -a test-debug --describe
 ```
 
 ## What you should see
@@ -125,7 +125,7 @@ For crash-looping processes, the output from the previous crashed container is a
 After deploying the test app and running the debug tool, verify:
 
 ### Interactive mode
-- [ ] Running `./convox-deploy-debug` with no arguments starts the guided wizard
+- [ ] Running `./convox-v3-deploy-debug` with no arguments starts the guided wizard
 - [ ] Dependency check reports `[ok]` for `convox`, `kubectl`, and `python3`
 - [ ] Rack selection shows available racks and lets you pick one
 - [ ] kubectl configuration step runs `convox rack kubeconfig` successfully

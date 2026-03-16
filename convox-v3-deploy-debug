@@ -1,16 +1,16 @@
 #!/usr/bin/env bash
 # =============================================================================
-# convox-deploy-debug v1.2.0
+# convox-v3-deploy-debug v1.2.0
 #
 # Diagnostic tool for capturing pre-healthcheck service logs during Convox deploys.
 #
-# convox logs does not surface service output until instances pass their health
+# convox logs does not surface service output until processes pass their health
 # check.  Most deploy failures happen before that point.  This script bridges
 # the gap by querying the cluster directly using Convox's namespace and label
 # conventions.
 #
 # Usage:
-#   convox-deploy-debug --rack <rack> --app <app> [OPTIONS]
+#   convox-v3-deploy-debug --rack <rack> --app <app> [OPTIONS]
 #
 # Requirements:
 #   - kubectl (cluster access -- the wizard sets this up automatically)
@@ -27,7 +27,7 @@ set -euo pipefail
 trap 'if [[ "${DEBUG:-}" == "1" ]]; then echo "[debug] FAILED at line $LINENO (exit $?): ${BASH_COMMAND}" >&2; fi' ERR
 
 readonly VERSION="1.2.0"
-readonly SCRIPT_NAME="convox-deploy-debug"
+readonly SCRIPT_NAME="convox-v3-deploy-debug"
 readonly KUBE_TIMEOUT="--request-timeout=10s"
 
 # ---------------------------------------------------------------------------
@@ -150,20 +150,20 @@ ${BLD}SERVICE DISCOVERY${RST}
       --manifest <path>      Path to convox.yml within the repo (default: convox.yml)
 
 ${BLD}FILTERING${RST}
-  -A, --age <seconds>        Service instance age threshold in seconds (default: 300)
-      --all                  Include all service instances, not just unhealthy/new ones
+  -A, --age <seconds>        Process age threshold in seconds (default: 300)
+      --all                  Include all processes, not just unhealthy/new ones
   -c, --checks <name>        Run only specific checks (repeatable). Options:
                                overview  - service rollout status and events
                                init      - init container detection
-                               services  - service instance logs, events, and classification
+                               services  - process logs, events, and classification
                              Default: all three. Example: -c services -c init
 
 ${BLD}OUTPUT${RST}
   -o, --output <mode>        Output mode: terminal, summary, json (default: terminal)
-  -n, --lines <count>        Number of log lines per service instance (default: 200)
+  -n, --lines <count>        Number of log lines per process (default: 200)
       --no-events            Skip cluster events
       --no-previous          Skip logs from previous crashes
-      --describe             Include full instance detail (k8s: pod describe)
+      --describe             Include full process detail (k8s: pod describe)
       --no-color             Disable colored output
 
 ${BLD}CLUSTER${RST}
@@ -221,7 +221,7 @@ ${BLD}EXAMPLES${RST}
   # Summary mode for quick triage
   $SCRIPT_NAME -r production -a myapp -o summary
 
-  # Run only service instance diagnostics (skip rollout overview and init checks)
+  # Run only service process diagnostics (skip rollout overview and init checks)
   $SCRIPT_NAME -r production -a myapp -c services
 
   # Run only rollout overview and init container checks
@@ -689,7 +689,7 @@ interactive_setup() {
   echo "    ${BLD}${cmd}${RST}" >&2
   echo "" >&2
   echo "  ${DIM}Run specific checks only (-c, repeatable, combine as needed):${RST}" >&2
-  echo "    ${DIM}-c services${RST}    service instance logs and classification" >&2
+  echo "    ${DIM}-c services${RST}    process logs and classification" >&2
   echo "    ${DIM}-c overview${RST}    service rollout status and events" >&2
   echo "    ${DIM}-c init${RST}        init container detection" >&2
   echo "" >&2
@@ -987,12 +987,12 @@ for deploy in deploys.get('items', []):
         if ct == 'Progressing' and cs == 'False':
             stalled = True
             if cr == 'ProgressDeadlineExceeded':
-                stall_msg = 'Deploy timed out -- service instances did not become healthy before the deadline'
+                stall_msg = 'Deploy timed out -- processes did not become healthy before the deadline'
             else:
                 stall_msg = cm or cr
         if ct == 'ReplicaFailure' and cs == 'True':
             stalled = True
-            stall_msg = stall_msg or cm or 'Failed to create new service instances'
+            stall_msg = stall_msg or cm or 'Failed to create new processes'
 
     if stalled:
         svc_status = 'stalled'
@@ -1058,15 +1058,15 @@ for ds in daemonsets.get('items', []):
 
 # ---------- deployment / replicaset warning events ----------
 reason_friendly = {
-    'FailedCreate': 'Could not create new service instances',
-    'FailedScheduling': 'Could not place service instance -- not enough capacity in the cluster',
+    'FailedCreate': 'Could not create new processes',
+    'FailedScheduling': 'Could not place process -- not enough capacity in the cluster',
     'ImagePullBackOff': 'Failed to pull the service image -- check build output and registry access',
     'ErrImagePull': 'Failed to pull the service image -- check build output and registry access',
-    'ProgressDeadlineExceeded': 'Deploy timed out -- service instances did not become healthy in time',
-    'OOMKilled': 'Service instance ran out of memory -- increase scale.memory in convox.yml',
+    'ProgressDeadlineExceeded': 'Deploy timed out -- processes did not become healthy in time',
+    'OOMKilled': 'Process ran out of memory -- increase scale.memory in convox.yml',
     'FailedMount': 'Failed to mount volume -- check volumeOptions in convox.yml',
     'FailedAttachVolume': 'Failed to attach volume',
-    'Evicted': 'Service instance was evicted (cluster resource pressure)',
+    'Evicted': 'Process was evicted (cluster resource pressure)',
     'InsufficientCPU': 'Not enough CPU in the cluster -- check scale.cpu in convox.yml',
     'InsufficientMemory': 'Not enough memory in the cluster -- check scale.memory in convox.yml',
 }
@@ -1149,7 +1149,7 @@ if services:
             icon, color = f'{DIM}○{RST}', DIM
 
         stype = f' {DIM}(agent){RST}' if agent else ''
-        pword = 'instance' if des == 1 else 'instances'
+        pword = 'process' if des == 1 else 'processes'
         body = f'{rdy}/{des} {pword} ready'
         status_label = status.upper()
         print(f'  {icon} {BLD}{name}{RST}{stype}  {color}{body}{RST}  {color}{status_label}{RST}')
@@ -1157,7 +1157,7 @@ if services:
         if stall_msg:
             print(f'      {RED}{stall_msg}{RST}')
         if traffic is False and status != 'scaled down':
-            print(f'      {YEL}Not receiving traffic -- no instances passing health checks yet{RST}')
+            print(f'      {YEL}Not receiving traffic -- no processes passing health checks yet{RST}')
             if output_mode != 'summary':
                 print(f'      {DIM}Check health.path in convox.yml matches a responding endpoint{RST}')
         if status in ('stalled', 'deploying') and not stall_msg:
@@ -1338,11 +1338,11 @@ print(len(data.get('items', [])))
 " 2>/dev/null || echo "0")
 
   if [[ "$pod_count" -eq 0 ]]; then
-    warn "No service instances found for app '$APP' on rack '$RACK'."
+    warn "No processes found for app '$APP' on rack '$RACK'."
     warn "This could mean:"
     warn "  - The app has not been deployed yet"
     warn "  - The service name is incorrect"
-    warn "  - The deploy has finished and old instances were cleaned up"
+    warn "  - The deploy has finished and old processes were cleaned up"
     return
   fi
 
@@ -1439,15 +1439,42 @@ for pod in data.get('items', []):
         continue
 
     detail = state_detail or init_waiting or phase
-    print(f'{name}|{service}|{phase}|{ready}|{age_sec}|{restart_count}|{classification}|{detail}')
+
+    # Actionable hints for common failure states
+    detail_hints = {
+        'CrashLoopBackOff': 'Process is crash-looping on startup -- check the logs below for the error',
+        'ImagePullBackOff': 'Failed to pull the container image -- check that the build succeeded and the image tag exists',
+        'ErrImagePull': 'Failed to pull the container image -- check registry access and image name',
+        'CreateContainerConfigError': 'Container config is invalid -- check environment variables and secrets (missing env var or secret reference?)',
+        'RunContainerError': 'Container failed to start -- check the command in convox.yml and that the entrypoint exists',
+        'OOMKilled': 'Process ran out of memory and was killed -- increase scale.memory in convox.yml',
+        'Completed': 'Process exited successfully but is not expected to stop -- check your command does not exit on its own',
+        'Error': 'Process exited with an error -- check the logs below',
+        'ContainerCannotRun': 'Container cannot run -- check that the Dockerfile CMD or convox.yml command is valid',
+        'InvalidImageName': 'Image name is invalid -- check build configuration',
+        'StartError': 'Container failed to start -- check logs below for the startup error',
+        'Unschedulable': 'Not enough resources in the cluster to place this process -- check scale.cpu and scale.memory in convox.yml',
+    }
+    # Also match detail patterns like 'Terminated:OOMKilled' or 'init:CrashLoopBackOff'
+    hint = detail_hints.get(detail, '')
+    if not hint:
+        for suffix in detail_hints:
+            if detail.endswith(':' + suffix):
+                hint = detail_hints[suffix]
+                break
+    # Pending phase hints
+    if not hint and phase == 'Pending':
+        hint = 'Process is waiting to be scheduled -- this usually means the cluster is low on resources'
+
+    print(f'{name}|{service}|{phase}|{ready}|{age_sec}|{restart_count}|{classification}|{detail}|{hint}')
 " 2>/dev/null)
 
   if [[ -z "$targets" ]]; then
     if [[ "$OUTPUT_MODE" == "json" ]]; then
-      echo '{"status":"ok","message":"All service instances are healthy and past the age threshold.","pods":[]}'
+      echo '{"status":"ok","message":"All processes are healthy and past the age threshold.","pods":[]}'
     else
-      info "All service instances are healthy and past the ${AGE_SECONDS}s age threshold."
-      info "If you expected to see failing instances, try increasing --age or using --all."
+      info "All processes are healthy and past the ${AGE_SECONDS}s age threshold."
+      info "If you expected to see failing processes, try increasing --age or using --all."
     fi
     return
   fi
@@ -1462,7 +1489,7 @@ for pod in data.get('items', []):
     CLEANUP_FILES+=("$json_parts_dir")
 
     local pod_idx=0
-    while IFS='|' read -r pod_name svc phase ready age_sec restarts classification detail; do
+    while IFS='|' read -r pod_name svc phase ready age_sec restarts classification detail hint; do
       [[ -z "$pod_name" ]] && continue
 
       local logs prev_logs events
@@ -1496,9 +1523,11 @@ if sys.argv[10]:
     pod['previousLogs'] = sys.argv[10]
 if sys.argv[11]:
     pod['events'] = sys.argv[11]
+if sys.argv[12]:
+    pod['hint'] = sys.argv[12]
 
 json.dump(pod, sys.stdout)
-" "$pod_name" "$svc" "$phase" "$ready" "$age_sec" "$restarts" "$classification" "$detail" "$logs" "$prev_logs" "$events" \
+" "$pod_name" "$svc" "$phase" "$ready" "$age_sec" "$restarts" "$classification" "$detail" "$logs" "$prev_logs" "$events" "$hint" \
         > "${json_parts_dir}/${pod_idx}.json"
 
       pod_idx=$((pod_idx + 1))
@@ -1551,9 +1580,9 @@ print()
     echo "  ${BLD}Deploy Debug Summary${RST}  ${DIM}${RACK}/${APP}  $(date -u +%Y-%m-%dT%H:%M:%SZ)${RST}"
     section_break
     echo ""
-    echo "  ${BLD}INSTANCE                                       SERVICE    STATUS       READY  RESTARTS DETAIL${RST}"
+    echo "  ${BLD}PROCESS                                        SERVICE    STATUS       READY  RESTARTS DETAIL${RST}"
     separator
-    while IFS='|' read -r pod_name svc phase ready age_sec restarts classification detail; do
+    while IFS='|' read -r pod_name svc phase ready age_sec restarts classification detail hint; do
       [[ -z "$pod_name" ]] && continue
       local icon="$RST"
       case "$classification" in
@@ -1568,6 +1597,7 @@ print()
       fi
       printf '  %s %-44s %-10s %-12s %-6s %-8s %s\n' \
         "$icon" "$pod_name" "$svc" "$phase($age_human)" "$ready" "$restarts" "$detail"
+      [[ -n "$hint" ]] && echo "    ${DIM}${hint}${RST}"
     done <<< "$targets"
     separator
     echo ""
@@ -1578,23 +1608,20 @@ print()
   # -----------------------------------------------------------------------
   # Terminal output mode (full)
   # -----------------------------------------------------------------------
-  local pod_index=0
   local total_pods
   total_pods=$(printf '%s\n' "$targets" | grep -c .)
 
   echo ""
-  echo "  ${BLD}${MAG}CONVOX DEPLOY DEBUG${RST}  ${DIM}v${VERSION}${RST}"
+  echo "  ${BLD}${MAG}CONVOX V3 DEPLOY DEBUG${RST}  ${DIM}v${VERSION}${RST}"
   section_break
   echo ""
   echo "    Rack  ${BLD}$RACK${RST}    App  ${BLD}$APP${RST}    ${DIM}namespace: $ns${RST}"
-  echo "    Time  ${DIM}$(date -u +%Y-%m-%dT%H:%M:%SZ)${RST}    Age threshold  ${DIM}${AGE_SECONDS}s${RST}    Instances  ${BLD}$total_pods${RST}"
+  echo "    Time  ${DIM}$(date -u +%Y-%m-%dT%H:%M:%SZ)${RST}    Age threshold  ${DIM}${AGE_SECONDS}s${RST}    Processes  ${BLD}$total_pods${RST}"
   echo ""
   separator
 
-  while IFS='|' read -r pod_name svc phase ready age_sec restarts classification detail; do
+  while IFS='|' read -r pod_name svc phase ready age_sec restarts classification detail hint; do
     [[ -z "$pod_name" ]] && continue
-    pod_index=$((pod_index + 1))
-
     local color="$RST" status_icon=""
     case "$classification" in
       unhealthy) color="$RED"; status_icon="${RED}●${RST}" ;;
@@ -1609,15 +1636,16 @@ print()
     fi
 
     echo ""
-    echo "  ${status_icon} ${BLD}Instance ${pod_index}/${total_pods}${RST}  ${color}${classification}${RST}"
-    echo "    ${DIM}name:${RST}    ${pod_name}"
-    echo "    ${DIM}service:${RST} ${BLD}${svc}${RST}    ${DIM}state:${RST} ${phase}    ${DIM}ready:${RST} ${ready}    ${DIM}age:${RST} ${age_human}    ${DIM}restarts:${RST} ${restarts}"
+    echo "  ${status_icon} ${BLD}${svc}${RST}  ${color}${classification}${RST}"
+    echo "    ${DIM}process:${RST} ${pod_name}"
+    echo "    ${DIM}state:${RST} ${phase}    ${DIM}ready:${RST} ${ready}    ${DIM}age:${RST} ${age_human}    ${DIM}restarts:${RST} ${restarts}"
     [[ -n "$detail" ]] && echo "    ${DIM}detail:${RST}  ${color}${detail}${RST}"
+    [[ -n "$hint" ]] && echo "    ${YEL}hint:${RST}    ${hint}"
 
     # --- Pod describe (optional) ---
     if [[ "$SHOW_DESCRIBE" == "true" ]]; then
       echo ""
-      echo "    ${DIM}─── full instance detail (k8s: pod describe) ───${RST}"
+      echo "    ${DIM}─── full process detail (k8s: pod describe) ───${RST}"
       kube describe pod -n "$ns" -- "$pod_name" 2>/dev/null | sed 's/^/      /'
     fi
 

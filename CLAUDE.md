@@ -2,14 +2,14 @@
 
 ## Project Overview
 
-`convox-deploy-debug` is a single-file Bash diagnostic tool distributed to Convox customers. It captures pre-healthcheck pod logs, events, and status during Convox deployments by querying kubectl directly. The tool bridges a gap in the Convox CLI where `convox logs` does not surface output until pods pass health checks.
+`convox-v3-deploy-debug` is a single-file Bash diagnostic tool distributed to Convox customers. It captures pre-healthcheck pod logs, events, and status during Convox deployments by querying kubectl directly. The tool bridges a gap in the Convox CLI where `convox logs` does not surface output until pods pass health checks.
 
 This is a Convox-maintained customer-facing tool. It ships as a standalone script with no installation step beyond `chmod +x`.
 
 ## Repository Structure
 
 ```
-convox-deploy-debug          # The script itself (bash, executable)
+convox-v3-deploy-debug          # The script itself (bash, executable)
 README.md                    # Customer-facing documentation
 CLAUDE.md                    # This file (committed, shared with the team)
 sync-docs.sh                 # Pulls upstream Convox docs for reference
@@ -182,34 +182,34 @@ There is no automated test suite. Verify changes manually:
 
 ```bash
 # Parse check
-bash -n convox-deploy-debug
+bash -n convox-v3-deploy-debug
 
 # shellcheck
-shellcheck convox-deploy-debug
+shellcheck convox-v3-deploy-debug
 
 # Help output renders correctly
-./convox-deploy-debug --help
+./convox-v3-deploy-debug --help
 
 # Version flag
-./convox-deploy-debug --version
+./convox-v3-deploy-debug --version
 
 # Validate JSON output is parseable (requires a live cluster)
-./convox-deploy-debug -r <rack> -a <app> -o json | jq .
+./convox-v3-deploy-debug -r <rack> -a <app> -o json | jq .
 
 # Test remote manifest fetch (public repo)
-./convox-deploy-debug -r <rack> -a <app> --repo github.com/convox/convox --branch master --manifest examples/convox.yml
+./convox-v3-deploy-debug -r <rack> -a <app> --repo github.com/convox/convox --branch master --manifest examples/convox.yml
 
 # Test color disable on pipe
-./convox-deploy-debug -r <rack> -a <app> | cat
+./convox-v3-deploy-debug -r <rack> -a <app> | cat
 
 # Test error paths
-./convox-deploy-debug -r nonexistent -a nonexistent
-./convox-deploy-debug -r <rack> -a <app> --repo github.com/nonexistent/nonexistent
-./convox-deploy-debug -r <rack> -a <app> -y /nonexistent/path
+./convox-v3-deploy-debug -r nonexistent -a nonexistent
+./convox-v3-deploy-debug -r <rack> -a <app> --repo github.com/nonexistent/nonexistent
+./convox-v3-deploy-debug -r <rack> -a <app> -y /nonexistent/path
 
 # Test argument guard (should error, not crash)
-./convox-deploy-debug --rack
-./convox-deploy-debug -r myrack --app
+./convox-v3-deploy-debug --rack
+./convox-v3-deploy-debug -r myrack --app
 ```
 
 ## Making Changes
@@ -235,7 +235,16 @@ The classification logic lives in the inline Python script inside `collect_diagn
 
 - The Python classification block
 - The terminal legend at the bottom of terminal mode output
-- The Pod Classification table in README.md
+- The Process Classification table in README.md
+
+### Changing Hints
+
+The `detail_hints` dictionary in the inline Python script maps k8s state detail strings (e.g., `CrashLoopBackOff`, `OOMKilled`) to plain-language hints. Hints are shown in all three output modes (terminal, summary, JSON). If you add a new hint:
+
+- Add the entry to `detail_hints` in the Python classification block
+- The hint will automatically propagate to all output modes via the pipe-delimited `hint` field
+- Update the Actionable Hints table in README.md
+- Hints also match suffixed patterns like `init:CrashLoopBackOff` and `Terminated:OOMKilled`
 
 ### Bumping the Version
 
