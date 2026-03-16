@@ -28,3 +28,4 @@ kubeconfig*
 
 # Upstream Convox docs (pulled via sync-docs.sh, not original content)
 docs/
+sync-docs.sh
