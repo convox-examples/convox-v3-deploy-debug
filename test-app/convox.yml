@@ -1,0 +1,33 @@
+environment:
+  - NODE_ENV=production
+
+services:
+  web:
+    build:
+      manifest: Dockerfile.web
+      path: .
+    port: 3000
+    health:
+      path: /health
+      interval: 5
+      timeout: 3
+      grace: 5
+    scale:
+      count: 1
+      cpu: 128
+      memory: 256
+
+  worker:
+    build:
+      manifest: Dockerfile.worker
+      path: .
+    port: 4000
+    health:
+      path: /health
+      interval: 5
+      timeout: 3
+      grace: 5
+    scale:
+      count: 1
+      cpu: 128
+      memory: 256

@@ -1,0 +1,1672 @@
+#!/usr/bin/env bash
+# =============================================================================
+# convox-deploy-debug v1.2.0
+#
+# Diagnostic tool for capturing pre-healthcheck pod logs during Convox deploys.
+#
+# convox logs does not surface pod output until containers pass their health
+# check.  Most deploy failures happen before that point.  This script bridges
+# the gap by querying kubectl directly using Convox's namespace and label
+# conventions.
+#
+# Usage:
+#   convox-deploy-debug --rack <rack> --app <app> [OPTIONS]
+#
+# Requirements:
+#   - kubectl configured with access to the target cluster
+#   - python3 (3.6+ for pod JSON parsing)
+#   - curl (for remote convox.yml fetching)
+#   - (optional) yq v4+ for reliable convox.yml parsing
+#
+# License: MIT
+# =============================================================================
+
+set -euo pipefail
+
+# Debug: trap ERR to show the failing line when DEBUG=1
+trap 'if [[ "${DEBUG:-}" == "1" ]]; then echo "[debug] FAILED at line $LINENO (exit $?): ${BASH_COMMAND}" >&2; fi' ERR
+
+readonly VERSION="1.2.0"
+readonly SCRIPT_NAME="convox-deploy-debug"
+readonly KUBE_TIMEOUT="--request-timeout=10s"
+
+# ---------------------------------------------------------------------------
+# Defaults
+# ---------------------------------------------------------------------------
+RACK=""
+APP=""
+SERVICES=()
+CONVOX_YML=""
+REPO_URL=""
+REPO_BRANCH="main"
+MANIFEST_PATH="convox.yml"
+AGE_SECONDS=300          # 5 minutes
+OUTPUT_MODE="terminal"   # terminal | summary | json
+LOG_LINES=200
+SHOW_EVENTS=true
+SHOW_PREVIOUS=true
+SHOW_DESCRIBE=false
+SHOW_ALL_PODS=false
+KUBECONFIG_ARG=""
+CONTEXT_ARG=""
+NO_COLOR=false
+INTERACTIVE=false
+CLEANUP_FILES=()
+OVERVIEW_JSON_FILE=""
+
+# Initialize color variables to empty so they're always defined.
+# setup_colors() will set them properly after arg parsing.
+RED="" GRN="" YEL="" BLU="" CYN="" MAG="" BLD="" DIM="" RST=""
+
+# ---------------------------------------------------------------------------
+# Colors (disabled when piped or --no-color)
+# ---------------------------------------------------------------------------
+setup_colors() {
+  if [[ "$NO_COLOR" == "true" ]] || [[ ! -t 1 ]]; then
+    RED="" GRN="" YEL="" BLU="" CYN="" MAG="" BLD="" DIM="" RST=""
+  else
+    RED=$'\033[0;31m' GRN=$'\033[0;32m' YEL=$'\033[0;33m'
+    BLU=$'\033[0;34m' CYN=$'\033[0;36m' MAG=$'\033[0;35m'
+    BLD=$'\033[1m'    DIM=$'\033[2m'    RST=$'\033[0m'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+info()  { echo "${BLU}>>>${RST} $*"; }
+warn()  { echo "${YEL}!!! $*${RST}" >&2; }
+err()   { echo "${RED}ERROR: $*${RST}" >&2; }
+debug() { [[ "${DEBUG:-}" == "1" ]] && echo "${DIM}[debug] $*${RST}" >&2 || true; }
+
+separator() {
+  printf '%s%s%s\n' "$DIM" "$(printf '%.0s-' {1..78})" "$RST"
+}
+
+# ---------------------------------------------------------------------------
+# Cleanup on exit
+# ---------------------------------------------------------------------------
+cleanup() {
+  local exit_code=$?
+  if [[ $exit_code -ne 0 ]] && [[ $exit_code -ne 130 ]]; then
+    # If we exited unexpectedly (not Ctrl-C), show the exit code for debugging
+    echo "${RED:-}ERROR: Script exited unexpectedly (exit code $exit_code).${RST:-}" >&2
+    echo "Run with --debug for more detail." >&2
+  fi
+  for f in "${CLEANUP_FILES[@]}"; do
+    [[ -f "$f" ]] && rm -f "$f"
+  done
+}
+trap cleanup EXIT
+
+# ---------------------------------------------------------------------------
+# Usage / Help
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<EOF
+${BLD}${SCRIPT_NAME} v${VERSION}${RST}
+Capture pre-healthcheck pod logs during Convox deployments.
+
+${BLD}USAGE${RST}
+  $SCRIPT_NAME --rack <rack> --app <app> [OPTIONS]
+  $SCRIPT_NAME --setup          Interactive guided mode
+  $SCRIPT_NAME                  (no args also starts guided mode)
+
+${BLD}REQUIRED${RST}
+  -r, --rack <name>          Convox rack name
+  -a, --app <name>           Convox app name
+
+${BLD}SERVICE DISCOVERY${RST}
+  -s, --service <name>       Target a specific service (repeatable)
+  -y, --convox-yml <path|url>   Local file path or raw URL to a convox.yml
+      --repo <url>           Repo URL to fetch convox.yml from (see below)
+      --branch <name>        Branch to use with --repo (default: main)
+      --manifest <path>      Path to convox.yml within the repo (default: convox.yml)
+
+${BLD}FILTERING${RST}
+  -A, --age <seconds>        Pod age threshold in seconds (default: 300)
+      --all                  Include all pods, not just unhealthy/new ones
+
+${BLD}OUTPUT${RST}
+  -o, --output <mode>        Output mode: terminal, summary, json (default: terminal)
+  -n, --lines <count>        Number of log lines per pod (default: 200)
+      --no-events            Skip pod events
+      --no-previous          Skip logs from previous (crashed) containers
+      --describe             Include full pod describe output
+      --no-color             Disable colored output
+
+${BLD}CLUSTER${RST}
+      --kubeconfig <path>    Path to kubeconfig file
+      --context <name>       Kubernetes context to use
+
+${BLD}GENERAL${RST}
+      --setup                Interactive guided setup (walks you through everything)
+  -h, --help                 Show this help
+  -v, --version              Show version
+      --debug                Enable debug output
+
+${BLD}REPO URL FORMAT${RST}
+  The --repo flag accepts repository URLs from GitHub, GitLab, and Bitbucket.
+  The script constructs the raw file URL automatically.
+
+  Accepted formats:
+    github.com/org/repo
+    gitlab.com/org/repo
+    bitbucket.org/org/repo
+    https://github.com/org/repo
+    https://github.com/org/repo.git
+    git@github.com:org/repo.git
+
+  Note: only public repos are supported. For private repos, clone locally
+  and use --convox-yml <path> instead.
+
+${BLD}EXAMPLES${RST}
+  # Basic: debug all services in an app
+  $SCRIPT_NAME -r production -a myapp
+
+  # Target a single service
+  $SCRIPT_NAME -r production -a myapp -s web
+
+  # Auto-discover services from local convox.yml
+  $SCRIPT_NAME -r production -a myapp -y ./convox.yml
+
+  # Auto-discover services from a GitHub repo
+  $SCRIPT_NAME -r production -a myapp --repo github.com/myorg/myapp
+
+  # Repo on a feature branch with a non-default manifest path
+  $SCRIPT_NAME -r production -a myapp \\
+    --repo github.com/myorg/myapp --branch staging --manifest deploy/convox.yml
+
+  # Auto-discover from a raw URL directly
+  $SCRIPT_NAME -r production -a myapp \\
+    -y https://raw.githubusercontent.com/myorg/myapp/main/convox.yml
+
+  # Wider time window, write to file
+  $SCRIPT_NAME -r production -a myapp -A 600 > deploy-debug.txt
+
+  # JSON output for programmatic consumption
+  $SCRIPT_NAME -r production -a myapp -o json > debug.json
+
+  # Summary mode for quick triage
+  $SCRIPT_NAME -r production -a myapp -o summary
+
+  # Interactive guided mode (walks you through rack, app, and kubectl setup)
+  $SCRIPT_NAME --setup
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing helper: require a value for a flag
+# ---------------------------------------------------------------------------
+require_arg() {
+  if [[ $# -lt 3 ]] || [[ "$3" == -* ]]; then
+    err "$1 requires an argument"
+    exit 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -r|--rack)        require_arg "$1" "$@"; RACK="$2";          shift 2 ;;
+      -a|--app)         require_arg "$1" "$@"; APP="$2";           shift 2 ;;
+      -s|--service)     require_arg "$1" "$@"; SERVICES+=("$2");   shift 2 ;;
+      -y|--convox-yml)  require_arg "$1" "$@"; CONVOX_YML="$2";    shift 2 ;;
+      --repo)           require_arg "$1" "$@"; REPO_URL="$2";      shift 2 ;;
+      --branch)         require_arg "$1" "$@"; REPO_BRANCH="$2";   shift 2 ;;
+      --manifest)       require_arg "$1" "$@"; MANIFEST_PATH="$2"; shift 2 ;;
+      -A|--age)         require_arg "$1" "$@"; AGE_SECONDS="$2";   shift 2 ;;
+      -o|--output)      require_arg "$1" "$@"; OUTPUT_MODE="$2";   shift 2 ;;
+      -n|--lines)       require_arg "$1" "$@"; LOG_LINES="$2";     shift 2 ;;
+      --all)            SHOW_ALL_PODS=true; shift ;;
+      --no-events)      SHOW_EVENTS=false;  shift ;;
+      --no-previous)    SHOW_PREVIOUS=false; shift ;;
+      --describe)       SHOW_DESCRIBE=true; shift ;;
+      --no-color)       NO_COLOR=true;      shift ;;
+      --kubeconfig)     require_arg "$1" "$@"; KUBECONFIG_ARG="--kubeconfig=$2"; shift 2 ;;
+      --kubeconfig=*)   KUBECONFIG_ARG="--kubeconfig=${1#*=}"; shift ;;
+      --context)        require_arg "$1" "$@"; CONTEXT_ARG="--context=$2";       shift 2 ;;
+      --context=*)      CONTEXT_ARG="--context=${1#*=}"; shift ;;
+      --setup)          INTERACTIVE=true;   shift ;;
+      --debug)          export DEBUG=1;     shift ;;
+      -h|--help)        usage; exit 0 ;;
+      -v|--version)     echo "$SCRIPT_NAME v$VERSION"; exit 0 ;;
+      *)                err "Unknown option: $1"; usage; exit 1 ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+validate() {
+  if [[ -z "$RACK" ]]; then
+    err "Missing required option: --rack"
+    echo "Run '$SCRIPT_NAME --help' for usage." >&2
+    exit 1
+  fi
+  if [[ -z "$APP" ]]; then
+    err "Missing required option: --app"
+    echo "Run '$SCRIPT_NAME --help' for usage." >&2
+    exit 1
+  fi
+  if ! command -v kubectl &>/dev/null; then
+    err "kubectl is required but not found in PATH."
+    exit 1
+  fi
+  if ! command -v python3 &>/dev/null; then
+    err "python3 is required but not found in PATH."
+    err "Python 3.6+ is needed for pod JSON parsing."
+    exit 1
+  fi
+  if [[ -n "$REPO_URL" ]] && [[ -n "$CONVOX_YML" ]]; then
+    err "Cannot use both --repo and --convox-yml. Pick one."
+    exit 1
+  fi
+  if [[ -n "$CONVOX_YML" ]] && [[ "$CONVOX_YML" != http* ]] && [[ ! -f "$CONVOX_YML" ]]; then
+    err "convox.yml not found at: $CONVOX_YML"
+    exit 1
+  fi
+  case "$OUTPUT_MODE" in
+    terminal|summary|json) ;;
+    *) err "Invalid output mode: $OUTPUT_MODE (use terminal, summary, or json)"; exit 1 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Interactive: yes/no prompt (default is second arg: y or n)
+# ---------------------------------------------------------------------------
+prompt_yes_no() {
+  local prompt_text="$1"
+  local default="${2:-y}"
+  local hint="[Y/n]"
+  [[ "$default" == "n" ]] && hint="[y/N]"
+
+  printf '%s %s ' "$prompt_text" "$hint" >&2
+  local answer
+  read -r answer < /dev/tty
+  answer="${answer:-$default}"
+  # bash 4.0+ lowercase
+  [[ "${answer,,}" == "y" ]]
+}
+
+# ---------------------------------------------------------------------------
+# Interactive: numbered menu prompt, prints selection to stdout
+# ---------------------------------------------------------------------------
+prompt_choice() {
+  local prompt_text="$1"
+  shift
+  local -a options=("$@")
+  local count=${#options[@]}
+
+  if [[ "$count" -eq 0 ]]; then
+    return 1
+  fi
+
+  echo "" >&2
+  echo "${BLD}${prompt_text}${RST}" >&2
+  echo "" >&2
+  local i
+  for i in "${!options[@]}"; do
+    echo "  ${BLD}$((i + 1))${RST}) ${options[$i]}" >&2
+  done
+  echo "" >&2
+
+  local choice
+  while true; do
+    printf 'Enter a number (1-%s): ' "$count" >&2
+    read -r choice < /dev/tty
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$count" ]]; then
+      echo "${options[$((choice - 1))]}"
+      return 0
+    fi
+    echo "  Invalid choice. Pick a number between 1 and ${count}." >&2
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Interactive: check dependencies with install guidance
+# ---------------------------------------------------------------------------
+check_interactive_deps() {
+  local all_ok=true
+  local platform
+  platform="$(uname -s)"
+
+  echo "" >&2
+  echo "${BLD}Checking dependencies...${RST}" >&2
+  echo "" >&2
+
+  # convox CLI
+  if command -v convox &>/dev/null; then
+    echo "  ${GRN}[ok]${RST} convox CLI" >&2
+  else
+    echo "  ${RED}[missing]${RST} convox CLI" >&2
+    echo "" >&2
+    echo "    Install the Convox CLI first:" >&2
+    case "$platform" in
+      Darwin)
+        echo "      brew install convox/tap/convox" >&2 ;;
+      Linux)
+        echo "      curl -L https://convox.com/cli/linux/convox -o /usr/local/bin/convox && chmod +x /usr/local/bin/convox" >&2 ;;
+      *)
+        echo "      See: https://docs.convox.com/installation/cli" >&2 ;;
+    esac
+    echo "" >&2
+    echo "    Then log in:  convox login <your-console-host>" >&2
+    all_ok=false
+  fi
+
+  # kubectl
+  if command -v kubectl &>/dev/null; then
+    echo "  ${GRN}[ok]${RST} kubectl" >&2
+  else
+    echo "  ${RED}[missing]${RST} kubectl" >&2
+    echo "" >&2
+    echo "    Install kubectl:" >&2
+    case "$platform" in
+      Darwin)
+        echo "      brew install kubectl" >&2 ;;
+      Linux)
+        echo "      curl -LO \"https://dl.k8s.io/release/\$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\"" >&2
+        echo "      chmod +x kubectl && sudo mv kubectl /usr/local/bin/" >&2 ;;
+      *)
+        echo "      See: https://kubernetes.io/docs/tasks/tools/" >&2 ;;
+    esac
+    echo "" >&2
+    echo "    Don't worry about configuring it -- this tool will handle that." >&2
+    all_ok=false
+  fi
+
+  # python3
+  if command -v python3 &>/dev/null; then
+    echo "  ${GRN}[ok]${RST} python3" >&2
+  else
+    echo "  ${RED}[missing]${RST} python3" >&2
+    echo "" >&2
+    echo "    Install Python 3.6+:" >&2
+    case "$platform" in
+      Darwin)
+        echo "      brew install python3" >&2 ;;
+      Linux)
+        echo "      sudo apt-get install python3   (Debian/Ubuntu)" >&2
+        echo "      sudo yum install python3        (RHEL/CentOS/Amazon Linux)" >&2 ;;
+      *)
+        echo "      See: https://www.python.org/downloads/" >&2 ;;
+    esac
+    all_ok=false
+  fi
+
+  if [[ "$all_ok" == "false" ]]; then
+    echo "" >&2
+    err "Install the missing dependencies above and run this again."
+    exit 1
+  fi
+
+  echo "" >&2
+}
+
+# ---------------------------------------------------------------------------
+# Interactive guided setup
+# ---------------------------------------------------------------------------
+interactive_setup() {
+  if [[ ! -t 0 ]]; then
+    err "Interactive mode requires a terminal."
+    err "For non-interactive usage: $SCRIPT_NAME --rack <rack> --app <app>"
+    err "Run '$SCRIPT_NAME --help' for all options."
+    exit 1
+  fi
+
+  echo "" >&2
+  echo "${BLD}${CYN}$SCRIPT_NAME v${VERSION}${RST} -- Interactive Setup" >&2
+  separator >&2
+
+  # -- Step 1: Check dependencies ------------------------------------------
+  check_interactive_deps
+
+  # -- Step 2: Rack selection ----------------------------------------------
+  info "Fetching available racks..."
+  local racks_output
+  racks_output=$(convox racks 2>/dev/null || true)
+
+  if [[ -z "$racks_output" ]]; then
+    err "Could not list racks. Make sure you are logged into Convox."
+    echo "  Run: convox login <your-console-host>" >&2
+    exit 1
+  fi
+
+  # Parse rack names from "convox racks" output
+  # Format: NAME                      PROVIDER  STATUS
+  #         nick-dev/test-logs-31626  aws       running
+  local -a rack_names=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # Skip header line (starts with NAME)
+    [[ "$line" =~ ^NAME[[:space:]] ]] && continue
+    local rname
+    rname="$(echo "$line" | awk '{print $1}')"
+    [[ -n "$rname" ]] && rack_names+=("$rname")
+  done <<< "$racks_output"
+
+  if [[ ${#rack_names[@]} -eq 0 ]]; then
+    err "No racks found. Set up a rack first."
+    echo "  See: https://docs.convox.com/installation/production-rack" >&2
+    exit 1
+  fi
+
+  # Get current rack name from "convox rack" output
+  # Format: Name      test-logs-31626
+  #         Provider  aws
+  #         ...
+  local current_rack_short=""
+  current_rack_short=$(convox rack 2>/dev/null | awk '/^Name[[:space:]]/{print $2}' || true)
+
+  # Find the full org/rack name from racks list that matches the short name
+  local current_rack=""
+  if [[ -n "$current_rack_short" ]]; then
+    local r
+    for r in "${rack_names[@]}"; do
+      # Match "org/short-name" or exact "short-name"
+      if [[ "$r" == */"$current_rack_short" ]] || [[ "$r" == "$current_rack_short" ]]; then
+        current_rack="$r"
+        break
+      fi
+    done
+    # If no match found in racks list, show the short name anyway
+    if [[ -z "$current_rack" ]]; then
+      current_rack="$current_rack_short"
+    fi
+  fi
+
+  if [[ -n "$current_rack" ]]; then
+    echo "  Current rack: ${BLD}${current_rack}${RST}" >&2
+  fi
+
+  local selected_rack=""
+
+  if [[ ${#rack_names[@]} -eq 1 ]]; then
+    selected_rack="${rack_names[0]}"
+    echo "" >&2
+    echo "  Only one rack available: ${BLD}${selected_rack}${RST}" >&2
+  elif [[ -n "$current_rack" ]]; then
+    echo "" >&2
+    if prompt_yes_no "  Use current rack ${BLD}${current_rack}${RST}?"; then
+      selected_rack="$current_rack"
+    else
+      selected_rack=$(prompt_choice "Select a rack:" "${rack_names[@]}")
+    fi
+  else
+    selected_rack=$(prompt_choice "Select a rack:" "${rack_names[@]}")
+  fi
+
+  # convox CLI commands need the full "org/rack" name, but the script uses
+  # just the rack name for k8s namespace construction (rack-app).
+  local convox_rack_full="$selected_rack"
+
+  # Strip the "org/" prefix if present to get the short rack name
+  if [[ "$selected_rack" == */* ]]; then
+    RACK="${selected_rack##*/}"
+  else
+    RACK="$selected_rack"
+  fi
+  info "Selected rack: ${BLD}${convox_rack_full}${RST}"
+
+  # -- Step 3: kubectl configuration ---------------------------------------
+  echo "" >&2
+  echo "  kubectl needs access to the cluster backing this rack." >&2
+  echo "  This runs: ${DIM}convox rack kubeconfig --rack $convox_rack_full${RST}" >&2
+  echo "" >&2
+
+  if prompt_yes_no "  Configure kubectl for rack ${BLD}${convox_rack_full}${RST}?"; then
+    info "Fetching kubeconfig from Convox..."
+    local kubeconfig_tmp
+    kubeconfig_tmp=$(mktemp "${TMPDIR:-/tmp}/convox-kubeconfig-XXXXXX")
+    CLEANUP_FILES+=("$kubeconfig_tmp")
+
+    if convox rack kubeconfig --rack "$convox_rack_full" > "$kubeconfig_tmp" 2>&1; then
+      # Verify the file looks like valid kubeconfig (has "clusters:" or "apiVersion:")
+      if grep -q "apiVersion\|clusters" "$kubeconfig_tmp" 2>/dev/null; then
+        KUBECONFIG_ARG="--kubeconfig=$kubeconfig_tmp"
+        echo "  ${GRN}[ok]${RST} kubectl configured (using temp kubeconfig)" >&2
+
+        # Offer to save it permanently
+        echo "" >&2
+        echo "  The kubeconfig is saved to a temp file for this session." >&2
+        echo "  To make it permanent, you can save it:" >&2
+        echo "    ${DIM}convox rack kubeconfig --rack $convox_rack_full > ~/.kube/config${RST}" >&2
+      else
+        warn "kubeconfig output does not look valid. Contents:"
+        head -5 "$kubeconfig_tmp" | sed 's/^/    /' >&2
+        warn "Continuing anyway -- kubectl may already be configured for this cluster."
+      fi
+    else
+      warn "Could not fetch kubeconfig:"
+      cat "$kubeconfig_tmp" | sed 's/^/    /' >&2
+      warn "Continuing anyway -- kubectl may already be configured for this cluster."
+    fi
+  else
+    echo "  Skipping. Make sure kubectl can reach the cluster." >&2
+    echo "  You can configure it later: ${DIM}convox rack kubeconfig --rack $convox_rack_full > ~/.kube/config${RST}" >&2
+  fi
+
+  # -- Quick kubectl connectivity test --------------------------------------
+  echo "" >&2
+  info "Testing kubectl connectivity..."
+  local kube_test_err
+  if kube_test_err=$(kubectl $KUBE_TIMEOUT $KUBECONFIG_ARG get namespaces --no-headers -o custom-columns=NAME:.metadata.name 2>&1); then
+    echo "  ${GRN}[ok]${RST} kubectl can reach the cluster" >&2
+  else
+    echo "" >&2
+    err "kubectl cannot reach the cluster."
+    echo "    $kube_test_err" | head -5 | sed 's/^/    /' >&2
+    echo "" >&2
+    err "Possible fixes:"
+    echo "  - Re-run this wizard and choose 'y' at the kubeconfig step" >&2
+    echo "  - Manually configure: convox rack kubeconfig --rack $convox_rack_full > ~/.kube/config" >&2
+    echo "  - Check your network connection to the cluster" >&2
+    exit 1
+  fi
+
+  # -- Step 4: App selection -----------------------------------------------
+  echo "" >&2
+  info "Fetching apps on rack ${BLD}${convox_rack_full}${RST}..."
+  local apps_output
+  apps_output=$(convox apps --rack "$convox_rack_full" 2>/dev/null || true)
+
+  if [[ -z "$apps_output" ]]; then
+    err "Could not list apps on rack '$convox_rack_full'."
+    exit 1
+  fi
+
+  # Parse app names from "convox apps" output
+  # Format: APP       STATUS    RELEASE
+  #         test-app  updating  RMTOBQJTVOJ
+  local -a app_names=()
+  while IFS= read -r line; do
+    [[ -z "$line" ]] && continue
+    # Skip header line (starts with APP)
+    [[ "$line" =~ ^APP[[:space:]] ]] && continue
+    local aname
+    aname="$(echo "$line" | awk '{print $1}')"
+    [[ -n "$aname" ]] && app_names+=("$aname")
+  done <<< "$apps_output"
+
+  if [[ ${#app_names[@]} -eq 0 ]]; then
+    err "No apps found on rack '$convox_rack_full'."
+    exit 1
+  fi
+
+  local selected_app=""
+
+  if [[ ${#app_names[@]} -eq 1 ]]; then
+    selected_app="${app_names[0]}"
+    echo "" >&2
+    echo "  Only one app available: ${BLD}${selected_app}${RST}" >&2
+  else
+    selected_app=$(prompt_choice "Select an app to debug:" "${app_names[@]}")
+  fi
+
+  APP="$selected_app"
+  info "Selected app: ${BLD}${APP}${RST}"
+
+  # -- Step 5: Optional convox.yml -----------------------------------------
+  echo "" >&2
+  echo "  A convox.yml helps discover your service names for better output." >&2
+  echo "  This is optional -- the tool works without it." >&2
+  echo "" >&2
+
+  if prompt_yes_no "  Do you have a convox.yml to point to?" "n"; then
+    echo "" >&2
+    printf '  Path or URL: ' >&2
+    local yml_path
+    read -r yml_path < /dev/tty
+    if [[ -n "$yml_path" ]]; then
+      CONVOX_YML="$yml_path"
+    fi
+  fi
+
+  # -- Step 6: Confirm and run ---------------------------------------------
+  echo "" >&2
+  separator >&2
+  echo "" >&2
+  echo "${BLD}Ready to run diagnostics:${RST}" >&2
+  echo "  Rack:  ${BLD}${convox_rack_full}${RST} (namespace prefix: ${RACK})" >&2
+  echo "  App:   ${BLD}${APP}${RST}" >&2
+  if [[ -n "$CONVOX_YML" ]]; then
+    echo "  Manifest: ${BLD}${CONVOX_YML}${RST}" >&2
+  fi
+  echo "" >&2
+
+  # Show the equivalent CLI command for future use (skip temp kubeconfig --
+  # the user should save their kubeconfig permanently instead)
+  local cmd="./$SCRIPT_NAME --rack ${RACK} --app ${APP}"
+  [[ -n "$CONVOX_YML" ]] && cmd+=" --convox-yml ${CONVOX_YML}"
+  echo "  ${DIM}Tip: next time you can skip this wizard with:${RST}" >&2
+  echo "    ${BLD}${cmd}${RST}" >&2
+  echo "" >&2
+
+  if ! prompt_yes_no "  Run diagnostics now?"; then
+    echo "" >&2
+    info "Exiting. Use the command above when you're ready."
+    exit 0
+  fi
+
+  echo "" >&2
+  info "Starting diagnostics..."
+  echo "" >&2
+  # RACK, APP, CONVOX_YML, and KUBECONFIG_ARG are now set.
+  # Control returns to main() which calls validate() and continues.
+}
+
+# ---------------------------------------------------------------------------
+# kubectl wrapper (includes request timeout)
+# ---------------------------------------------------------------------------
+kube() {
+  # shellcheck disable=SC2086
+  kubectl $KUBE_TIMEOUT $KUBECONFIG_ARG $CONTEXT_ARG "$@"
+}
+
+# ---------------------------------------------------------------------------
+# JSON escape via python3 (handles all control characters correctly)
+# ---------------------------------------------------------------------------
+json_escape() {
+  python3 -c "import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))" <<< "$1"
+}
+
+# ---------------------------------------------------------------------------
+# Remote convox.yml: normalize repo URL to a raw file URL
+# ---------------------------------------------------------------------------
+normalize_repo_url() {
+  local raw="$1"
+
+  # Strip trailing .git
+  raw="${raw%.git}"
+
+  # Strip leading https:// or http://
+  raw="${raw#https://}"
+  raw="${raw#http://}"
+
+  # Handle SSH format: git@github.com:org/repo -> github.com/org/repo
+  if [[ "$raw" == git@* ]]; then
+    raw="${raw#git@}"
+    raw="${raw/://}"
+  fi
+
+  echo "$raw"
+}
+
+build_raw_url() {
+  local normalized="$1"
+  local branch="$2"
+  local path="$3"
+
+  # Strip leading slash from manifest path
+  path="${path#/}"
+
+  if [[ "$normalized" == github.com/* ]]; then
+    local repo_path="${normalized#github.com/}"
+    echo "https://raw.githubusercontent.com/${repo_path}/${branch}/${path}"
+
+  elif [[ "$normalized" == gitlab.com/* ]]; then
+    local repo_path="${normalized#gitlab.com/}"
+    echo "https://gitlab.com/${repo_path}/-/raw/${branch}/${path}"
+
+  elif [[ "$normalized" == bitbucket.org/* ]]; then
+    local repo_path="${normalized#bitbucket.org/}"
+    echo "https://bitbucket.org/${repo_path}/raw/${branch}/${path}"
+
+  else
+    err "Unsupported repository host in: $normalized"
+    err "Supported hosts: github.com, gitlab.com, bitbucket.org"
+    err "You can also pass a raw URL directly with --convox-yml <url>"
+    exit 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Fetch remote convox.yml (from --repo or --convox-yml URL)
+# ---------------------------------------------------------------------------
+fetch_remote_manifest() {
+  local url=""
+
+  if [[ -n "$REPO_URL" ]]; then
+    local normalized
+    normalized=$(normalize_repo_url "$REPO_URL")
+    url=$(build_raw_url "$normalized" "$REPO_BRANCH" "$MANIFEST_PATH")
+    debug "Normalized repo: $normalized"
+  elif [[ "$CONVOX_YML" == http* ]]; then
+    url="$CONVOX_YML"
+  else
+    return 0
+  fi
+
+  if ! command -v curl &>/dev/null; then
+    err "curl is required for fetching remote convox.yml files."
+    exit 1
+  fi
+
+  info "Fetching convox.yml from: $url"
+  debug "Full URL: $url"
+
+  local tmpfile
+  tmpfile=$(mktemp "${TMPDIR:-/tmp}/convox-yml-XXXXXX.yml")
+  CLEANUP_FILES+=("$tmpfile")
+
+  local http_code
+  http_code=$(curl -sL -w "%{http_code}" -o "$tmpfile" "$url" 2>/dev/null || echo "000")
+
+  if [[ "$http_code" != "200" ]]; then
+    err "Failed to fetch convox.yml (HTTP $http_code)"
+    if [[ "$http_code" == "404" ]]; then
+      err "File not found. Check the repo URL, branch, and manifest path."
+      if [[ -n "$REPO_URL" ]]; then
+        err "  Repo:     $REPO_URL"
+        err "  Branch:   $REPO_BRANCH"
+        err "  Manifest: $MANIFEST_PATH"
+        err "  Full URL: $url"
+      fi
+    elif [[ "$http_code" == "000" ]]; then
+      err "Network error. Check your connection and the URL."
+    else
+      err "Unexpected response. The repo may be private."
+      err "For private repos, clone locally and use --convox-yml <path> instead."
+    fi
+    exit 1
+  fi
+
+  # Validate it looks like YAML (basic sanity check)
+  if ! grep -qE '^(services|environment|resources|timers):' "$tmpfile" 2>/dev/null; then
+    warn "Downloaded file may not be a valid convox.yml (no services/resources section found)."
+    warn "Continuing anyway, but service discovery may fail."
+  fi
+
+  CONVOX_YML="$tmpfile"
+  info "Remote convox.yml fetched successfully."
+}
+
+# ---------------------------------------------------------------------------
+# Service discovery from convox.yml
+# ---------------------------------------------------------------------------
+discover_services() {
+  if [[ -z "$CONVOX_YML" ]]; then
+    return
+  fi
+
+  if command -v yq &>/dev/null; then
+    info "Reading services from convox.yml using yq"
+    local discovered
+    discovered=$(yq e '.services | keys | .[]' "$CONVOX_YML" 2>/dev/null || true)
+    if [[ -n "$discovered" ]]; then
+      while IFS= read -r svc; do
+        SERVICES+=("$svc")
+      done <<< "$discovered"
+      info "Discovered services: ${SERVICES[*]}"
+    else
+      warn "No services found in convox.yml"
+    fi
+  else
+    info "Reading services from convox.yml using grep (install yq for better parsing)"
+    local in_services=false
+    while IFS= read -r line; do
+      if [[ "$line" =~ ^services: ]]; then
+        in_services=true
+        continue
+      fi
+      if $in_services; then
+        if [[ "$line" =~ ^[a-z] ]] && [[ ! "$line" =~ ^[[:space:]] ]]; then
+          break
+        fi
+        if [[ "$line" =~ ^[[:space:]]{2}([a-zA-Z0-9_-]+): ]]; then
+          SERVICES+=("${BASH_REMATCH[1]}")
+        fi
+      fi
+    done < "$CONVOX_YML"
+    if [[ ${#SERVICES[@]} -gt 0 ]]; then
+      info "Discovered services: ${SERVICES[*]}"
+    else
+      warn "Could not parse services from convox.yml"
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Pod classification
+# ---------------------------------------------------------------------------
+readonly NAMESPACE_FMT="%s-%s"
+
+# ---------------------------------------------------------------------------
+# Deployment overview: service rollout status, resource health, deploy events
+# ---------------------------------------------------------------------------
+deployment_overview() {
+  local ns
+  # shellcheck disable=SC2059
+  ns=$(printf "$NAMESPACE_FMT" "$RACK" "$APP")
+
+  # Bail silently if namespace doesn't exist (collect_diagnostics reports the error)
+  if ! kube get namespace "$ns" &>/dev/null; then
+    return
+  fi
+
+  debug "Gathering service and resource status for namespace $ns"
+
+  # Gather all data
+  local deploys_json ds_json events_json endpoints_json
+  deploys_json=$(kube get deployments -n "$ns" -l "system=convox" -o json 2>/dev/null || echo '{"items":[]}')
+  ds_json=$(kube get daemonsets -n "$ns" -l "system=convox" -o json 2>/dev/null || echo '{"items":[]}')
+  events_json=$(kube get events -n "$ns" --sort-by='.lastTimestamp' -o json 2>/dev/null || echo '{"items":[]}')
+  endpoints_json=$(kube get endpoints -n "$ns" -l "system=convox" -o json 2>/dev/null || echo '{"items":[]}')
+
+  # Write inputs to temp files for Python
+  local tmp_d tmp_ds tmp_ev tmp_ep
+  tmp_d=$(mktemp "${TMPDIR:-/tmp}/convox-d-XXXXXX.json")
+  tmp_ds=$(mktemp "${TMPDIR:-/tmp}/convox-ds-XXXXXX.json")
+  tmp_ev=$(mktemp "${TMPDIR:-/tmp}/convox-ev-XXXXXX.json")
+  tmp_ep=$(mktemp "${TMPDIR:-/tmp}/convox-ep-XXXXXX.json")
+  CLEANUP_FILES+=("$tmp_d" "$tmp_ds" "$tmp_ev" "$tmp_ep")
+
+  echo "$deploys_json" > "$tmp_d"
+  echo "$ds_json" > "$tmp_ds"
+  echo "$events_json" > "$tmp_ev"
+  echo "$endpoints_json" > "$tmp_ep"
+
+  # Temp file for JSON mode output (merged into final JSON later)
+  OVERVIEW_JSON_FILE=$(mktemp "${TMPDIR:-/tmp}/convox-overview-XXXXXX.json")
+  CLEANUP_FILES+=("$OVERVIEW_JSON_FILE")
+
+  # Process and render via Python (colors + output mode passed as env vars)
+  # shellcheck disable=SC2155
+  DEPLOYS_FILE="$tmp_d" \
+  DS_FILE="$tmp_ds" \
+  EVENTS_FILE="$tmp_ev" \
+  ENDPOINTS_FILE="$tmp_ep" \
+  OUT_MODE="$OUTPUT_MODE" \
+  JSON_OUT="$OVERVIEW_JSON_FILE" \
+  C_RED="$RED" C_GRN="$GRN" C_YEL="$YEL" C_BLU="$BLU" \
+  C_CYN="$CYN" C_MAG="$MAG" C_BLD="$BLD" C_DIM="$DIM" C_RST="$RST" \
+  python3 << 'OVERVIEW_PYEOF'
+import json, sys, os
+
+# ---------- env ----------
+RED = os.environ.get('C_RED', '')
+GRN = os.environ.get('C_GRN', '')
+YEL = os.environ.get('C_YEL', '')
+BLU = os.environ.get('C_BLU', '')
+CYN = os.environ.get('C_CYN', '')
+MAG = os.environ.get('C_MAG', '')
+BLD = os.environ.get('C_BLD', '')
+DIM = os.environ.get('C_DIM', '')
+RST = os.environ.get('C_RST', '')
+
+with open(os.environ['DEPLOYS_FILE']) as f:
+    deploys = json.load(f)
+with open(os.environ['DS_FILE']) as f:
+    daemonsets = json.load(f)
+with open(os.environ['EVENTS_FILE']) as f:
+    all_events = json.load(f)
+with open(os.environ['ENDPOINTS_FILE']) as f:
+    endpoints = json.load(f)
+
+output_mode = os.environ['OUT_MODE']
+DIV = DIM + '-' * 78 + RST
+
+# ---------- build service + resource lists ----------
+services = []
+resources = []
+
+for deploy in deploys.get('items', []):
+    meta = deploy.get('metadata', {})
+    labels = meta.get('labels', {})
+    svc_name = labels.get('service', '')
+    res_name = labels.get('resource', '')
+    spec = deploy.get('spec', {})
+    status = deploy.get('status', {})
+
+    desired = spec.get('replicas', 0)
+    ready = status.get('readyReplicas', 0) or 0
+    available = status.get('availableReplicas', 0) or 0
+    updated = status.get('updatedReplicas', 0) or 0
+
+    # deployment conditions
+    conditions = status.get('conditions', [])
+    stalled = False
+    stall_msg = ''
+    for c in conditions:
+        ct, cs, cr = c.get('type',''), c.get('status',''), c.get('reason','')
+        cm = c.get('message', '')
+        if ct == 'Progressing' and cs == 'False':
+            stalled = True
+            if cr == 'ProgressDeadlineExceeded':
+                stall_msg = 'Deploy timed out -- processes did not become healthy before the deadline'
+            else:
+                stall_msg = cm or cr
+        if ct == 'ReplicaFailure' and cs == 'True':
+            stalled = True
+            stall_msg = stall_msg or cm or 'Failed to create new processes'
+
+    if stalled:
+        svc_status = 'stalled'
+    elif ready < desired:
+        svc_status = 'deploying'
+    elif ready == desired and desired > 0:
+        svc_status = 'running'
+    else:
+        svc_status = 'scaled down'
+
+    # endpoint/traffic check
+    receiving_traffic = None
+    target_name = svc_name or res_name
+    for ep in endpoints.get('items', []):
+        ep_labels = ep.get('metadata', {}).get('labels', {})
+        if ep_labels.get('service') == target_name or ep_labels.get('resource') == target_name:
+            subsets = ep.get('subsets', [])
+            addr_count = sum(len(s.get('addresses', [])) for s in subsets)
+            receiving_traffic = addr_count > 0
+            break
+
+    entry = {
+        'name': res_name or svc_name or meta.get('name', ''),
+        'desired': desired,
+        'ready': ready,
+        'available': available,
+        'status': svc_status,
+        'stallMessage': stall_msg,
+        'receivingTraffic': receiving_traffic,
+    }
+
+    if res_name:
+        resources.append(entry)
+    elif svc_name:
+        services.append(entry)
+
+for ds in daemonsets.get('items', []):
+    labels = ds.get('metadata', {}).get('labels', {})
+    svc_name = labels.get('service', '')
+    if not svc_name:
+        continue
+    st = ds.get('status', {})
+    desired = st.get('desiredNumberScheduled', 0)
+    ready = st.get('numberReady', 0) or 0
+
+    if ready < desired:
+        svc_status = 'deploying'
+    elif ready == desired and desired > 0:
+        svc_status = 'running'
+    else:
+        svc_status = 'scaled down'
+
+    services.append({
+        'name': svc_name,
+        'desired': desired,
+        'ready': ready,
+        'available': ready,
+        'status': svc_status,
+        'stallMessage': '',
+        'receivingTraffic': None,
+        'agent': True,
+    })
+
+# ---------- deployment / replicaset warning events ----------
+reason_friendly = {
+    'FailedCreate': 'Could not create new processes',
+    'FailedScheduling': 'Could not schedule process -- not enough capacity in the cluster',
+    'ImagePullBackOff': 'Failed to pull the container image -- check build output and registry access',
+    'ErrImagePull': 'Failed to pull the container image -- check build output and registry access',
+    'ProgressDeadlineExceeded': 'Deploy timed out -- processes did not become healthy in time',
+    'OOMKilled': 'Process ran out of memory -- increase scale.memory in convox.yml',
+    'FailedMount': 'Failed to mount volume -- check volume configuration in convox.yml',
+    'FailedAttachVolume': 'Failed to attach volume',
+    'Evicted': 'Process was evicted (cluster resource pressure)',
+    'InsufficientCPU': 'Not enough CPU in the cluster -- check scale.cpu in convox.yml',
+    'InsufficientMemory': 'Not enough memory in the cluster -- check scale.memory in convox.yml',
+}
+
+all_names = {}
+for s in services:
+    all_names[s['name']] = s['name']
+for r in resources:
+    all_names['resource-' + r['name']] = r['name']
+
+svc_events = []
+for event in all_events.get('items', []):
+    kind = event.get('involvedObject', {}).get('kind', '')
+    etype = event.get('type', '')
+    if etype == 'Normal':
+        continue
+    if kind not in ('Deployment', 'ReplicaSet'):
+        continue
+
+    reason = event.get('reason', '')
+    message = event.get('message', '')
+    obj_name = event.get('involvedObject', {}).get('name', '')
+    timestamp = (event.get('lastTimestamp', '')
+                 or event.get('metadata', {}).get('creationTimestamp', ''))
+
+    matched = ''
+    for name, label in all_names.items():
+        if obj_name == name or obj_name.startswith(name + '-'):
+            matched = label
+            break
+
+    friendly = reason_friendly.get(reason, '')
+    svc_events.append({
+        'service': matched or obj_name,
+        'time': timestamp,
+        'reason': reason,
+        'message': friendly or message,
+        'raw': message if friendly else '',
+    })
+
+# ---------- JSON mode ----------
+if output_mode == 'json':
+    result = {'services': [], 'resources': []}
+    for s in services:
+        entry = dict(s)
+        entry['events'] = [e for e in svc_events if e['service'] == s['name']]
+        result['services'].append(entry)
+    for r in resources:
+        result['resources'].append(dict(r))
+    with open(os.environ['JSON_OUT'], 'w') as f:
+        json.dump(result, f)
+    sys.exit(0)
+
+# ---------- nothing to show ----------
+if not services and not resources:
+    sys.exit(0)
+
+# ---------- terminal / summary rendering ----------
+
+# -- service rollout status --
+if services:
+    print()
+    print(f'{BLD}{MAG}SERVICE STATUS{RST}')
+    print(DIV)
+    for s in services:
+        name = s['name']
+        rdy, des = s['ready'], s['desired']
+        status = s['status']
+        stall_msg = s.get('stallMessage', '')
+        traffic = s.get('receivingTraffic')
+        agent = s.get('agent', False)
+
+        if status == 'running':
+            tag, color = f'{GRN}[RUNNING]{RST}', GRN
+        elif status == 'stalled':
+            tag, color = f'{RED}[STALLED]{RST}', RED
+        elif status == 'deploying':
+            tag, color = f'{YEL}[DEPLOYING]{RST}', YEL
+        else:
+            tag, color = f'{DIM}[{status.upper()}]{RST}', DIM
+
+        stype = ' (agent)' if agent else ''
+        pword = 'process' if des == 1 else 'processes'
+        body = f'{rdy}/{des} {pword} ready'
+        pad = max(1, 68 - len(name) - len(body) - len(stype))
+        print(f'  {BLD}{name}{RST}{stype}  {color}{body}{RST}{" " * pad}{tag}')
+
+        if stall_msg:
+            print(f'    {RED}{stall_msg}{RST}')
+        if traffic is False and status != 'scaled down':
+            print(f'    {YEL}Not receiving traffic -- no processes passing health checks yet{RST}')
+            if output_mode != 'summary':
+                print(f'    {DIM}Check health.path in convox.yml matches a responding endpoint{RST}')
+        if status in ('stalled', 'deploying') and not stall_msg:
+            if output_mode != 'summary':
+                print(f'    {DIM}Tip: check process logs below for crash details or health check failures{RST}')
+    print(DIV)
+
+# -- resource health --
+if resources:
+    print()
+    print(f'{BLD}{MAG}RESOURCE STATUS{RST}')
+    print(DIV)
+    for r in resources:
+        name, rdy, des = r['name'], r['ready'], r['desired']
+        status = r['status']
+        if status == 'running':
+            tag = f'{GRN}[OK]{RST}'
+        elif rdy == 0 and des > 0:
+            tag = f'{RED}[DOWN]{RST}'
+        else:
+            tag = f'{YEL}[DEGRADED]{RST}'
+        body = f'{rdy}/{des} running'
+        pad = max(1, 68 - len(name) - len(body))
+        print(f'  {BLD}{name}{RST}  {body}{" " * pad}{tag}')
+        if rdy == 0 and des > 0:
+            print(f'    {DIM}Services depending on this resource may fail to connect{RST}')
+    print(DIV)
+
+# -- deploy events (warnings from Deployments / ReplicaSets) --
+if svc_events:
+    seen = set()
+    unique = []
+    for e in svc_events:
+        key = (e['service'], e['reason'])
+        if key not in seen:
+            seen.add(key)
+            unique.append(e)
+    if unique:
+        print()
+        print(f'{BLD}{YEL}SERVICE EVENTS{RST}')
+        print(DIV)
+        for e in unique[:15]:
+            msg = e['message']
+            raw = e.get('raw', '')
+            print(f'  {YEL}{e["service"]}{RST}  {msg}')
+            if raw and raw != msg:
+                if len(raw) > 120:
+                    raw = raw[:117] + '...'
+                print(f'    {DIM}{raw}{RST}')
+        print(DIV)
+
+if output_mode == 'summary':
+    print()
+    print(f'{DIM}Use terminal mode (-o terminal) for full process logs.{RST}')
+OVERVIEW_PYEOF
+}
+
+# ---------------------------------------------------------------------------
+# Init container diagnostics (all output modes)
+# ---------------------------------------------------------------------------
+check_init_containers() {
+  local ns
+  # shellcheck disable=SC2059
+  ns=$(printf "$NAMESPACE_FMT" "$RACK" "$APP")
+
+  local label_selector="system=convox"
+  if [[ ${#SERVICES[@]} -eq 1 ]]; then
+    label_selector+=",service=${SERVICES[0]}"
+  fi
+
+  # Find pods stuck in Init phase
+  local init_pods
+  init_pods=$(kube get pods -n "$ns" -l "$label_selector" \
+    --no-headers 2>/dev/null | grep -i "init:" || true)
+
+  if [[ -z "$init_pods" ]]; then
+    return
+  fi
+
+  if [[ "$OUTPUT_MODE" == "json" ]]; then
+    # Init container data is included in the main JSON pod output via
+    # the Python classifier (init_waiting field). No separate section needed
+    # here, but we log for debug visibility.
+    debug "Init container issues detected (included in pod JSON output)"
+    return
+  fi
+
+  if [[ "$OUTPUT_MODE" == "summary" ]]; then
+    echo ""
+    echo "${BLD}${YEL}INIT CONTAINER ISSUES DETECTED${RST}"
+    separator
+    while read -r line; do
+      local pod_name pod_status
+      pod_name=$(echo "$line" | awk '{print $1}')
+      pod_status=$(echo "$line" | awk '{print $3}')
+      echo "${YEL}Pod:${RST} $pod_name  ${YEL}Status:${RST} $pod_status"
+    done <<< "$init_pods"
+    separator
+    echo "${DIM}Use terminal mode (-o terminal) for init container logs.${RST}"
+    echo ""
+    return
+  fi
+
+  # Terminal mode: full init container logs
+  echo ""
+  echo "${BLD}${YEL}INIT CONTAINER ISSUES DETECTED${RST}"
+  separator
+  while read -r line; do
+    local pod_name
+    pod_name=$(echo "$line" | awk '{print $1}')
+    echo "${YEL}Pod:${RST} $pod_name"
+    echo "${YEL}Status:${RST} $(echo "$line" | awk '{print $3}')"
+    echo ""
+    echo "    ${BLD}Init Container Logs:${RST}"
+    # Fetch logs from all init containers, not just one named "init"
+    local init_container_names
+    init_container_names=$(kube get pod "$pod_name" -n "$ns" \
+      -o jsonpath='{.spec.initContainers[*].name}' 2>/dev/null || true)
+    if [[ -n "$init_container_names" ]]; then
+      for ic_name in $init_container_names; do
+        echo "    ${DIM}[container: ${ic_name}]${RST}"
+        kube logs -n "$ns" -c "$ic_name" --tail=50 -- "$pod_name" 2>&1 | sed 's/^/    /' || true
+      done
+    else
+      # Fallback: try --all-containers
+      kube logs -n "$ns" --all-containers --tail=50 -- "$pod_name" 2>&1 | sed 's/^/    /' || true
+    fi
+    separator
+  done <<< "$init_pods"
+}
+
+# ---------------------------------------------------------------------------
+# Core: collect and display pod diagnostics
+# ---------------------------------------------------------------------------
+collect_diagnostics() {
+  local ns
+  # shellcheck disable=SC2059
+  ns=$(printf "$NAMESPACE_FMT" "$RACK" "$APP")
+
+  # Verify namespace exists
+  local ns_err
+  if ! ns_err=$(kube get namespace "$ns" 2>&1); then
+    err "Namespace '$ns' not found. Verify rack name '$RACK' and app name '$APP'."
+    if [[ -n "$ns_err" ]]; then
+      echo "    kubectl said: $ns_err" | head -3 | sed 's/^/  /' >&2
+    fi
+    err ""
+    err "Available Convox namespaces on this cluster:"
+    local avail_ns
+    avail_ns=$(kube get ns --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null | grep -E "^${RACK}-" || true)
+    if [[ -n "$avail_ns" ]]; then
+      echo "$avail_ns" | sed 's/^/  /' >&2
+    else
+      echo "  (none found matching rack '$RACK')" >&2
+    fi
+    err ""
+    err "Check that the rack name matches. The namespace should be '<rack>-<app>'."
+    exit 1
+  fi
+
+  # Build label selector
+  local label_selector="system=convox"
+  if [[ ${#SERVICES[@]} -eq 1 ]]; then
+    label_selector+=",service=${SERVICES[0]}"
+  fi
+
+  debug "Namespace: $ns"
+  debug "Label selector: $label_selector"
+  debug "Age threshold: ${AGE_SECONDS}s"
+
+  # Fetch pods as JSON for parsing
+  local pods_json
+  pods_json=$(kube get pods -n "$ns" -l "$label_selector" -o json 2>/dev/null)
+
+  local pod_count
+  pod_count=$(echo "$pods_json" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(len(data.get('items', [])))
+" 2>/dev/null || echo "0")
+
+  if [[ "$pod_count" -eq 0 ]]; then
+    warn "No pods found in namespace '$ns' with label '$label_selector'."
+    warn "This could mean:"
+    warn "  - The app has not been deployed yet"
+    warn "  - The service name is incorrect"
+    warn "  - The deployment has already completed and old pods were cleaned up"
+    return
+  fi
+
+  # Write services list to a temp file to avoid shell interpolation issues in Python
+  local svc_file
+  svc_file=$(mktemp "${TMPDIR:-/tmp}/convox-svc-XXXXXX.txt")
+  CLEANUP_FILES+=("$svc_file")
+  if [[ ${#SERVICES[@]} -gt 0 ]]; then
+    printf '%s\n' "${SERVICES[@]}" > "$svc_file"
+  fi
+
+  # Parse pods and collect targets
+  local targets
+  targets=$(echo "$pods_json" | python3 -c "
+import json, sys, time, os
+
+data = json.load(sys.stdin)
+now = time.time()
+
+svc_file = '${svc_file}'
+service_filter = set()
+if os.path.getsize(svc_file) > 0:
+    with open(svc_file) as f:
+        service_filter = set(line.strip() for line in f if line.strip())
+
+age_threshold = int('${AGE_SECONDS}')
+show_all = '${SHOW_ALL_PODS}' == 'true'
+
+for pod in data.get('items', []):
+    metadata = pod.get('metadata', {})
+    name = metadata.get('name', '')
+    labels = metadata.get('labels', {})
+    service = labels.get('service', 'unknown')
+
+    # Filter by service if specified
+    if service_filter and service not in service_filter:
+        continue
+
+    status = pod.get('status', {})
+    phase = status.get('phase', 'Unknown')
+
+    # Determine readiness
+    conditions = status.get('conditions', [])
+    ready = 'false'
+    for c in conditions:
+        if c.get('type') == 'Ready' and c.get('status') == 'True':
+            ready = 'true'
+
+    # Calculate age
+    created = metadata.get('creationTimestamp', '')
+    try:
+        from datetime import datetime, timezone
+        ct = datetime.fromisoformat(created.replace('Z', '+00:00'))
+        age_sec = int(now - ct.timestamp())
+    except Exception as e:
+        import sys as _sys
+        print(f'[debug] Failed to parse timestamp {created!r}: {e}', file=_sys.stderr)
+        age_sec = -1
+
+    # Container statuses for extra context
+    container_statuses = status.get('containerStatuses', [])
+    init_statuses = status.get('initContainerStatuses', [])
+    restart_count = sum(cs.get('restartCount', 0) for cs in container_statuses)
+
+    # Determine container state detail
+    state_detail = ''
+    for cs in container_statuses:
+        state = cs.get('state', {})
+        if 'waiting' in state:
+            state_detail = state['waiting'].get('reason', '')
+        elif 'terminated' in state:
+            state_detail = 'Terminated:' + state['terminated'].get('reason', '')
+
+    # Check init containers
+    init_waiting = ''
+    for ics in init_statuses:
+        state = ics.get('state', {})
+        if 'waiting' in state:
+            init_waiting = 'init:' + state['waiting'].get('reason', '')
+        elif 'terminated' in state and state['terminated'].get('exitCode', 0) != 0:
+            init_waiting = 'init:Failed(exit=' + str(state['terminated'].get('exitCode', '?')) + ')'
+
+    # Classify
+    if phase != 'Running':
+        classification = 'unhealthy'
+    elif ready == 'false':
+        classification = 'not-ready'
+    elif age_sec >= 0 and age_sec <= age_threshold:
+        classification = 'new'
+    else:
+        classification = 'healthy'
+
+    if not show_all and classification == 'healthy':
+        continue
+
+    detail = state_detail or init_waiting or phase
+    print(f'{name}|{service}|{phase}|{ready}|{age_sec}|{restart_count}|{classification}|{detail}')
+" 2>/dev/null)
+
+  if [[ -z "$targets" ]]; then
+    if [[ "$OUTPUT_MODE" == "json" ]]; then
+      echo '{"status":"ok","message":"All pods are healthy and past the age threshold.","pods":[]}'
+    else
+      info "All pods are healthy and past the ${AGE_SECONDS}s age threshold."
+      info "If you expected to see failing pods, try increasing --age or using --all."
+    fi
+    return
+  fi
+
+  # -----------------------------------------------------------------------
+  # JSON output mode (built entirely via python3 for correct escaping)
+  # -----------------------------------------------------------------------
+  if [[ "$OUTPUT_MODE" == "json" ]]; then
+    # Collect all pod data into a temp file, then assemble JSON via python3
+    local json_parts_dir
+    json_parts_dir=$(mktemp -d "${TMPDIR:-/tmp}/convox-json-XXXXXX")
+    CLEANUP_FILES+=("$json_parts_dir")
+
+    local pod_idx=0
+    while IFS='|' read -r pod_name svc phase ready age_sec restarts classification detail; do
+      [[ -z "$pod_name" ]] && continue
+
+      local logs prev_logs events
+      logs=$(kube logs -n "$ns" --all-containers --tail="$LOG_LINES" -- "$pod_name" 2>&1 || true)
+      prev_logs=""
+      if [[ "$SHOW_PREVIOUS" == "true" ]]; then
+        prev_logs=$(kube logs -n "$ns" --all-containers --previous --tail="$LOG_LINES" -- "$pod_name" 2>&1 || true)
+        [[ "$prev_logs" == *"previous terminated container"*"not found"* ]] && prev_logs=""
+      fi
+      events=""
+      if [[ "$SHOW_EVENTS" == "true" ]]; then
+        events=$(kube get events -n "$ns" --field-selector "involvedObject.name=$pod_name" --sort-by='.lastTimestamp' 2>/dev/null || true)
+      fi
+
+      # Write each pod's JSON via python3 for correct escaping
+      python3 -c "
+import json, sys
+
+pod = {
+    'name': sys.argv[1],
+    'service': sys.argv[2],
+    'phase': sys.argv[3],
+    'ready': sys.argv[4] == 'true',
+    'ageSeconds': int(sys.argv[5]),
+    'restarts': int(sys.argv[6]),
+    'classification': sys.argv[7],
+    'stateDetail': sys.argv[8],
+    'logs': sys.argv[9],
+}
+if sys.argv[10]:
+    pod['previousLogs'] = sys.argv[10]
+if sys.argv[11]:
+    pod['events'] = sys.argv[11]
+
+json.dump(pod, sys.stdout)
+" "$pod_name" "$svc" "$phase" "$ready" "$age_sec" "$restarts" "$classification" "$detail" "$logs" "$prev_logs" "$events" \
+        > "${json_parts_dir}/${pod_idx}.json"
+
+      pod_idx=$((pod_idx + 1))
+    done <<< "$targets"
+
+    # Assemble final JSON (merges overview data if available)
+    python3 -c "
+import json, sys, glob, os
+
+result = {
+    'namespace': sys.argv[1],
+    'rack': sys.argv[2],
+    'app': sys.argv[3],
+    'timestamp': sys.argv[4],
+    'pods': []
+}
+
+# Merge service/resource overview data
+overview_file = sys.argv[6]
+if overview_file and os.path.exists(overview_file) and os.path.getsize(overview_file) > 0:
+    with open(overview_file) as f:
+        overview = json.load(f)
+    result['services'] = overview.get('services', [])
+    result['resources'] = overview.get('resources', [])
+
+parts_dir = sys.argv[5]
+idx = 0
+while True:
+    path = os.path.join(parts_dir, f'{idx}.json')
+    if not os.path.exists(path):
+        break
+    with open(path) as f:
+        result['pods'].append(json.load(f))
+    idx += 1
+
+json.dump(result, sys.stdout)
+print()
+" "$ns" "$RACK" "$APP" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$json_parts_dir" "$OVERVIEW_JSON_FILE"
+
+    # Clean up temp dir
+    rm -rf "$json_parts_dir"
+    return
+  fi
+
+  # -----------------------------------------------------------------------
+  # Summary output mode
+  # -----------------------------------------------------------------------
+  if [[ "$OUTPUT_MODE" == "summary" ]]; then
+    echo ""
+    echo "${BLD}Deploy Debug Summary${RST}  ${DIM}${RACK}/${APP}  $(date -u +%Y-%m-%dT%H:%M:%SZ)${RST}"
+    separator
+    # Use echo for the header to avoid printf color/width issues
+    echo "${BLD}POD                                           SERVICE    STATUS       READY  RESTARTS DETAIL${RST}"
+    separator
+    while IFS='|' read -r pod_name svc phase ready age_sec restarts classification detail; do
+      [[ -z "$pod_name" ]] && continue
+      local color="$RST"
+      case "$classification" in
+        unhealthy) color="$RED" ;;
+        not-ready) color="$YEL" ;;
+        new)       color="$CYN" ;;
+      esac
+      local age_human="${age_sec}s"
+      if [[ "$age_sec" -ge 60 ]]; then
+        age_human="$((age_sec / 60))m$((age_sec % 60))s"
+      fi
+      # Use echo with manually padded fields to avoid printf color/width issues
+      printf '%s%-45s %-10s %-12s %-6s %-8s %s%s\n' \
+        "$color" "$pod_name" "$svc" "$phase($age_human)" "$ready" "$restarts" "$detail" "$RST"
+    done <<< "$targets"
+    separator
+    echo ""
+    echo "${DIM}Use terminal mode (-o terminal) for full logs.${RST}"
+    return
+  fi
+
+  # -----------------------------------------------------------------------
+  # Terminal output mode (full)
+  # -----------------------------------------------------------------------
+  local pod_index=0
+  local total_pods
+  total_pods=$(printf '%s\n' "$targets" | grep -c .)
+
+  echo ""
+  echo "${BLD}${MAG}CONVOX DEPLOY DEBUG${RST}  ${DIM}v${VERSION}${RST}"
+  echo "${BLD}Rack:${RST} $RACK  ${BLD}App:${RST} $APP  ${BLD}Namespace:${RST} $ns"
+  echo "${BLD}Time:${RST} $(date -u +%Y-%m-%dT%H:%M:%SZ)  ${BLD}Age threshold:${RST} ${AGE_SECONDS}s"
+  echo "${BLD}Target pods:${RST} $total_pods"
+  separator
+
+  while IFS='|' read -r pod_name svc phase ready age_sec restarts classification detail; do
+    [[ -z "$pod_name" ]] && continue
+    pod_index=$((pod_index + 1))
+
+    local color="$RST" status_icon=""
+    case "$classification" in
+      unhealthy) color="$RED"; status_icon="X" ;;
+      not-ready) color="$YEL"; status_icon="!" ;;
+      new)       color="$CYN"; status_icon="*" ;;
+      healthy)   color="$GRN"; status_icon="+" ;;
+    esac
+
+    local age_human="${age_sec}s"
+    if [[ "$age_sec" -ge 60 ]]; then
+      age_human="$((age_sec / 60))m$((age_sec % 60))s"
+    fi
+
+    echo ""
+    echo "${color}${BLD}[${status_icon}] Pod ${pod_index}/${total_pods}: ${pod_name}${RST}"
+    echo "    ${BLD}Service:${RST} $svc  ${BLD}Phase:${RST} $phase  ${BLD}Ready:${RST} $ready  ${BLD}Age:${RST} $age_human  ${BLD}Restarts:${RST} $restarts"
+    [[ -n "$detail" ]] && echo "    ${BLD}State:${RST} ${color}${detail}${RST}"
+
+    # --- Pod describe (optional) ---
+    if [[ "$SHOW_DESCRIBE" == "true" ]]; then
+      echo ""
+      echo "    ${BLD}${BLU}--- Pod Describe ---${RST}"
+      kube describe pod -n "$ns" -- "$pod_name" 2>/dev/null | sed 's/^/    /'
+    fi
+
+    # --- Events ---
+    if [[ "$SHOW_EVENTS" == "true" ]]; then
+      echo ""
+      echo "    ${BLD}${BLU}--- Events ---${RST}"
+      local events
+      events=$(kube get events -n "$ns" \
+        --field-selector "involvedObject.name=$pod_name" \
+        --sort-by='.lastTimestamp' \
+        --no-headers \
+        -o custom-columns='TIME:.lastTimestamp,TYPE:.type,REASON:.reason,MESSAGE:.message' \
+        2>/dev/null || true)
+      if [[ -n "$events" ]]; then
+        echo "$events" | sed 's/^/    /'
+      else
+        echo "    ${DIM}(no events found)${RST}"
+      fi
+    fi
+
+    # --- Current container logs ---
+    echo ""
+    echo "    ${BLD}${BLU}--- Logs (tail ${LOG_LINES}) ---${RST}"
+    local logs
+    logs=$(kube logs -n "$ns" --all-containers --tail="$LOG_LINES" -- "$pod_name" 2>&1 || true)
+    if [[ -n "$logs" ]]; then
+      echo "$logs" | sed 's/^/    /'
+    else
+      echo "    ${DIM}(no logs available)${RST}"
+    fi
+
+    # --- Previous container logs (for CrashLoopBackOff) ---
+    if [[ "$SHOW_PREVIOUS" == "true" ]]; then
+      local prev_logs
+      prev_logs=$(kube logs -n "$ns" --all-containers --previous --tail="$LOG_LINES" -- "$pod_name" 2>&1 || true)
+      if [[ -n "$prev_logs" ]] && [[ "$prev_logs" != *"previous terminated container"*"not found"* ]]; then
+        echo ""
+        echo "    ${BLD}${YEL}--- Previous Container Logs (crashed) ---${RST}"
+        echo "$prev_logs" | sed 's/^/    /'
+      fi
+    fi
+
+    separator
+  done <<< "$targets"
+
+  echo ""
+  echo "${BLD}Legend:${RST}  ${RED}[X] Unhealthy${RST}  ${YEL}[!] Not Ready${RST}  ${CYN}[*] New${RST}  ${GRN}[+] Healthy${RST}"
+  echo ""
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+main() {
+  if [[ $# -eq 0 ]]; then
+    # No arguments: enter interactive guided mode
+    setup_colors
+    interactive_setup
+  else
+    parse_args "$@"
+    setup_colors
+    if [[ "$INTERACTIVE" == "true" ]]; then
+      interactive_setup
+    fi
+  fi
+
+  validate
+  fetch_remote_manifest
+  discover_services
+
+  # Verify the namespace exists before running diagnostics
+  local ns
+  # shellcheck disable=SC2059
+  ns=$(printf "$NAMESPACE_FMT" "$RACK" "$APP")
+  info "Checking namespace ${BLD}${ns}${RST}..."
+
+  local ns_check_err
+  if ! ns_check_err=$(kube get namespace "$ns" 2>&1); then
+    err "Namespace '$ns' not found on this cluster."
+    if [[ -n "$ns_check_err" ]]; then
+      echo "  $ns_check_err" >&2
+    fi
+    echo "" >&2
+    err "This means the rack name or app name might not match what Kubernetes sees."
+    echo "" >&2
+    echo "  Namespaces on this cluster that look like Convox apps:" >&2
+    kube get ns --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null \
+      | grep -v "^kube-" | grep -v "^default$" | sed 's/^/    /' >&2 || true
+    echo "" >&2
+    echo "  Expected namespace: ${BLD}${ns}${RST}" >&2
+    echo "  Your rack name ('$RACK') should match the prefix of one of these namespaces." >&2
+    exit 1
+  fi
+
+  debug "Namespace $ns exists"
+  deployment_overview
+  check_init_containers
+  collect_diagnostics
+}
+
+main "$@"
