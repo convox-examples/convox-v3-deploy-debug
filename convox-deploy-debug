@@ -2,19 +2,19 @@
 # =============================================================================
 # convox-deploy-debug v1.2.0
 #
-# Diagnostic tool for capturing pre-healthcheck pod logs during Convox deploys.
+# Diagnostic tool for capturing pre-healthcheck service logs during Convox deploys.
 #
-# convox logs does not surface pod output until containers pass their health
+# convox logs does not surface service output until instances pass their health
 # check.  Most deploy failures happen before that point.  This script bridges
-# the gap by querying kubectl directly using Convox's namespace and label
+# the gap by querying the cluster directly using Convox's namespace and label
 # conventions.
 #
 # Usage:
 #   convox-deploy-debug --rack <rack> --app <app> [OPTIONS]
 #
 # Requirements:
-#   - kubectl configured with access to the target cluster
-#   - python3 (3.6+ for pod JSON parsing)
+#   - kubectl (cluster access -- the wizard sets this up automatically)
+#   - python3 (3.6+ for JSON parsing)
 #   - curl (for remote convox.yml fetching)
 #   - (optional) yq v4+ for reliable convox.yml parsing
 #
@@ -51,6 +51,7 @@ KUBECONFIG_ARG=""
 CONTEXT_ARG=""
 NO_COLOR=false
 INTERACTIVE=false
+CHECKS=()
 CLEANUP_FILES=()
 OVERVIEW_JSON_FILE=""
 
@@ -105,7 +106,7 @@ trap cleanup EXIT
 usage() {
   cat <<EOF
 ${BLD}${SCRIPT_NAME} v${VERSION}${RST}
-Capture pre-healthcheck pod logs during Convox deployments.
+Capture pre-healthcheck service logs during Convox deployments.
 
 ${BLD}USAGE${RST}
   $SCRIPT_NAME --rack <rack> --app <app> [OPTIONS]
@@ -124,15 +125,20 @@ ${BLD}SERVICE DISCOVERY${RST}
       --manifest <path>      Path to convox.yml within the repo (default: convox.yml)
 
 ${BLD}FILTERING${RST}
-  -A, --age <seconds>        Pod age threshold in seconds (default: 300)
-      --all                  Include all pods, not just unhealthy/new ones
+  -A, --age <seconds>        Service instance age threshold in seconds (default: 300)
+      --all                  Include all service instances, not just unhealthy/new ones
+  -c, --checks <name>        Run only specific checks (repeatable). Options:
+                               overview  - service rollout status and events
+                               init      - init container detection
+                               services  - service instance logs, events, and classification
+                             Default: all three. Example: -c services -c init
 
 ${BLD}OUTPUT${RST}
   -o, --output <mode>        Output mode: terminal, summary, json (default: terminal)
-  -n, --lines <count>        Number of log lines per pod (default: 200)
-      --no-events            Skip pod events
-      --no-previous          Skip logs from previous (crashed) containers
-      --describe             Include full pod describe output
+  -n, --lines <count>        Number of log lines per service instance (default: 200)
+      --no-events            Skip cluster events
+      --no-previous          Skip logs from previous crashes
+      --describe             Include full instance detail (k8s: pod describe)
       --no-color             Disable colored output
 
 ${BLD}CLUSTER${RST}
@@ -190,6 +196,12 @@ ${BLD}EXAMPLES${RST}
   # Summary mode for quick triage
   $SCRIPT_NAME -r production -a myapp -o summary
 
+  # Run only service instance diagnostics (skip rollout overview and init checks)
+  $SCRIPT_NAME -r production -a myapp -c services
+
+  # Run only rollout overview and init container checks
+  $SCRIPT_NAME -r production -a myapp -c overview -c init
+
   # Interactive guided mode (walks you through rack, app, and kubectl setup)
   $SCRIPT_NAME --setup
 EOF
@@ -218,6 +230,7 @@ parse_args() {
       --repo)           require_arg "$1" "$@"; REPO_URL="$2";      shift 2 ;;
       --branch)         require_arg "$1" "$@"; REPO_BRANCH="$2";   shift 2 ;;
       --manifest)       require_arg "$1" "$@"; MANIFEST_PATH="$2"; shift 2 ;;
+      -c|--checks)      require_arg "$1" "$@"; CHECKS+=("$2");     shift 2 ;;
       -A|--age)         require_arg "$1" "$@"; AGE_SECONDS="$2";   shift 2 ;;
       -o|--output)      require_arg "$1" "$@"; OUTPUT_MODE="$2";   shift 2 ;;
       -n|--lines)       require_arg "$1" "$@"; LOG_LINES="$2";     shift 2 ;;
@@ -274,6 +287,29 @@ validate() {
     terminal|summary|json) ;;
     *) err "Invalid output mode: $OUTPUT_MODE (use terminal, summary, or json)"; exit 1 ;;
   esac
+  local c
+  for c in "${CHECKS[@]}"; do
+    case "$c" in
+      overview|init|services) ;;
+      *) err "Invalid check name: $c (use overview, init, or services)"; exit 1 ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Check if a given check name should run (true if --checks not specified, or
+# if the name was included in the --checks list)
+# ---------------------------------------------------------------------------
+should_run_check() {
+  local name="$1"
+  if [[ ${#CHECKS[@]} -eq 0 ]]; then
+    return 0  # no filter, run everything
+  fi
+  local c
+  for c in "${CHECKS[@]}"; do
+    [[ "$c" == "$name" ]] && return 0
+  done
+  return 1
 }
 
 # ---------------------------------------------------------------------------
@@ -637,6 +673,11 @@ interactive_setup() {
   echo "  ${DIM}Tip: next time you can skip this wizard with:${RST}" >&2
   echo "    ${BLD}${cmd}${RST}" >&2
   echo "" >&2
+  echo "  ${DIM}To run only specific checks, add -c (repeatable):${RST}" >&2
+  echo "    ${DIM}${cmd} -c services${RST}           ${DIM}# just service instance logs and classification${RST}" >&2
+  echo "    ${DIM}${cmd} -c overview -c init${RST}   ${DIM}# rollout status + init containers${RST}" >&2
+  echo "    ${DIM}Available checks: overview, init, services${RST}" >&2
+  echo "" >&2
 
   if ! prompt_yes_no "  Run diagnostics now?"; then
     echo "" >&2
@@ -929,12 +970,12 @@ for deploy in deploys.get('items', []):
         if ct == 'Progressing' and cs == 'False':
             stalled = True
             if cr == 'ProgressDeadlineExceeded':
-                stall_msg = 'Deploy timed out -- processes did not become healthy before the deadline'
+                stall_msg = 'Deploy timed out -- service instances did not become healthy before the deadline'
             else:
                 stall_msg = cm or cr
         if ct == 'ReplicaFailure' and cs == 'True':
             stalled = True
-            stall_msg = stall_msg or cm or 'Failed to create new processes'
+            stall_msg = stall_msg or cm or 'Failed to create new service instances'
 
     if stalled:
         svc_status = 'stalled'
@@ -1000,15 +1041,15 @@ for ds in daemonsets.get('items', []):
 
 # ---------- deployment / replicaset warning events ----------
 reason_friendly = {
-    'FailedCreate': 'Could not create new processes',
-    'FailedScheduling': 'Could not schedule process -- not enough capacity in the cluster',
-    'ImagePullBackOff': 'Failed to pull the container image -- check build output and registry access',
-    'ErrImagePull': 'Failed to pull the container image -- check build output and registry access',
-    'ProgressDeadlineExceeded': 'Deploy timed out -- processes did not become healthy in time',
-    'OOMKilled': 'Process ran out of memory -- increase scale.memory in convox.yml',
-    'FailedMount': 'Failed to mount volume -- check volume configuration in convox.yml',
+    'FailedCreate': 'Could not create new service instances',
+    'FailedScheduling': 'Could not place service instance -- not enough capacity in the cluster',
+    'ImagePullBackOff': 'Failed to pull the service image -- check build output and registry access',
+    'ErrImagePull': 'Failed to pull the service image -- check build output and registry access',
+    'ProgressDeadlineExceeded': 'Deploy timed out -- service instances did not become healthy in time',
+    'OOMKilled': 'Service instance ran out of memory -- increase scale.memory in convox.yml',
+    'FailedMount': 'Failed to mount volume -- check volumeOptions in convox.yml',
     'FailedAttachVolume': 'Failed to attach volume',
-    'Evicted': 'Process was evicted (cluster resource pressure)',
+    'Evicted': 'Service instance was evicted (cluster resource pressure)',
     'InsufficientCPU': 'Not enough CPU in the cluster -- check scale.cpu in convox.yml',
     'InsufficientMemory': 'Not enough memory in the cluster -- check scale.memory in convox.yml',
 }
@@ -1091,7 +1132,7 @@ if services:
             tag, color = f'{DIM}[{status.upper()}]{RST}', DIM
 
         stype = ' (agent)' if agent else ''
-        pword = 'process' if des == 1 else 'processes'
+        pword = 'instance' if des == 1 else 'instances'
         body = f'{rdy}/{des} {pword} ready'
         pad = max(1, 68 - len(name) - len(body) - len(stype))
         print(f'  {BLD}{name}{RST}{stype}  {color}{body}{RST}{" " * pad}{tag}')
@@ -1099,12 +1140,12 @@ if services:
         if stall_msg:
             print(f'    {RED}{stall_msg}{RST}')
         if traffic is False and status != 'scaled down':
-            print(f'    {YEL}Not receiving traffic -- no processes passing health checks yet{RST}')
+            print(f'    {YEL}Not receiving traffic -- no instances passing health checks yet{RST}')
             if output_mode != 'summary':
                 print(f'    {DIM}Check health.path in convox.yml matches a responding endpoint{RST}')
         if status in ('stalled', 'deploying') and not stall_msg:
             if output_mode != 'summary':
-                print(f'    {DIM}Tip: check process logs below for crash details or health check failures{RST}')
+                print(f'    {DIM}Tip: check service logs below for crash details or health check failures{RST}')
     print(DIV)
 
 # -- resource health --
@@ -1153,7 +1194,7 @@ if svc_events:
 
 if output_mode == 'summary':
     print()
-    print(f'{DIM}Use terminal mode (-o terminal) for full process logs.{RST}')
+    print(f'{DIM}Use terminal mode (-o terminal) for full service logs.{RST}')
 OVERVIEW_PYEOF
 }
 
@@ -1195,7 +1236,7 @@ check_init_containers() {
       local pod_name pod_status
       pod_name=$(echo "$line" | awk '{print $1}')
       pod_status=$(echo "$line" | awk '{print $3}')
-      echo "${YEL}Pod:${RST} $pod_name  ${YEL}Status:${RST} $pod_status"
+      echo "${YEL}Instance:${RST} $pod_name  ${YEL}Status:${RST} $pod_status"
     done <<< "$init_pods"
     separator
     echo "${DIM}Use terminal mode (-o terminal) for init container logs.${RST}"
@@ -1210,7 +1251,7 @@ check_init_containers() {
   while read -r line; do
     local pod_name
     pod_name=$(echo "$line" | awk '{print $1}')
-    echo "${YEL}Pod:${RST} $pod_name"
+    echo "${YEL}Instance (k8s: pod):${RST} $pod_name"
     echo "${YEL}Status:${RST} $(echo "$line" | awk '{print $3}')"
     echo ""
     echo "    ${BLD}Init Container Logs:${RST}"
@@ -1242,12 +1283,12 @@ collect_diagnostics() {
   # Verify namespace exists
   local ns_err
   if ! ns_err=$(kube get namespace "$ns" 2>&1); then
-    err "Namespace '$ns' not found. Verify rack name '$RACK' and app name '$APP'."
+    err "App namespace '$ns' not found. Verify rack name '$RACK' and app name '$APP'."
     if [[ -n "$ns_err" ]]; then
-      echo "    kubectl said: $ns_err" | head -3 | sed 's/^/  /' >&2
+      echo "    (k8s: $ns_err)" | head -3 | sed 's/^/  /' >&2
     fi
     err ""
-    err "Available Convox namespaces on this cluster:"
+    err "Available Convox app namespaces on this cluster:"
     local avail_ns
     avail_ns=$(kube get ns --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null | grep -E "^${RACK}-" || true)
     if [[ -n "$avail_ns" ]]; then
@@ -1256,7 +1297,7 @@ collect_diagnostics() {
       echo "  (none found matching rack '$RACK')" >&2
     fi
     err ""
-    err "Check that the rack name matches. The namespace should be '<rack>-<app>'."
+    err "Check that the rack name matches. Convox creates a namespace named '<rack>-<app>'."
     exit 1
   fi
 
@@ -1282,11 +1323,11 @@ print(len(data.get('items', [])))
 " 2>/dev/null || echo "0")
 
   if [[ "$pod_count" -eq 0 ]]; then
-    warn "No pods found in namespace '$ns' with label '$label_selector'."
+    warn "No service instances found for app '$APP' on rack '$RACK'."
     warn "This could mean:"
     warn "  - The app has not been deployed yet"
     warn "  - The service name is incorrect"
-    warn "  - The deployment has already completed and old pods were cleaned up"
+    warn "  - The deploy has finished and old instances were cleaned up"
     return
   fi
 
@@ -1388,10 +1429,10 @@ for pod in data.get('items', []):
 
   if [[ -z "$targets" ]]; then
     if [[ "$OUTPUT_MODE" == "json" ]]; then
-      echo '{"status":"ok","message":"All pods are healthy and past the age threshold.","pods":[]}'
+      echo '{"status":"ok","message":"All service instances are healthy and past the age threshold.","pods":[]}'
     else
-      info "All pods are healthy and past the ${AGE_SECONDS}s age threshold."
-      info "If you expected to see failing pods, try increasing --age or using --all."
+      info "All service instances are healthy and past the ${AGE_SECONDS}s age threshold."
+      info "If you expected to see failing instances, try increasing --age or using --all."
     fi
     return
   fi
@@ -1495,7 +1536,7 @@ print()
     echo "${BLD}Deploy Debug Summary${RST}  ${DIM}${RACK}/${APP}  $(date -u +%Y-%m-%dT%H:%M:%SZ)${RST}"
     separator
     # Use echo for the header to avoid printf color/width issues
-    echo "${BLD}POD                                           SERVICE    STATUS       READY  RESTARTS DETAIL${RST}"
+    echo "${BLD}INSTANCE (K8S: POD)                            SERVICE    STATUS       READY  RESTARTS DETAIL${RST}"
     separator
     while IFS='|' read -r pod_name svc phase ready age_sec restarts classification detail; do
       [[ -z "$pod_name" ]] && continue
@@ -1515,7 +1556,7 @@ print()
     done <<< "$targets"
     separator
     echo ""
-    echo "${DIM}Use terminal mode (-o terminal) for full logs.${RST}"
+    echo "${DIM}Use terminal mode (-o terminal) for full service logs.${RST}"
     return
   fi
 
@@ -1528,9 +1569,9 @@ print()
 
   echo ""
   echo "${BLD}${MAG}CONVOX DEPLOY DEBUG${RST}  ${DIM}v${VERSION}${RST}"
-  echo "${BLD}Rack:${RST} $RACK  ${BLD}App:${RST} $APP  ${BLD}Namespace:${RST} $ns"
+  echo "${BLD}Rack:${RST} $RACK  ${BLD}App:${RST} $APP  ${BLD}Namespace (k8s):${RST} $ns"
   echo "${BLD}Time:${RST} $(date -u +%Y-%m-%dT%H:%M:%SZ)  ${BLD}Age threshold:${RST} ${AGE_SECONDS}s"
-  echo "${BLD}Target pods:${RST} $total_pods"
+  echo "${BLD}Service instances:${RST} $total_pods"
   separator
 
   while IFS='|' read -r pod_name svc phase ready age_sec restarts classification detail; do
@@ -1551,21 +1592,21 @@ print()
     fi
 
     echo ""
-    echo "${color}${BLD}[${status_icon}] Pod ${pod_index}/${total_pods}: ${pod_name}${RST}"
-    echo "    ${BLD}Service:${RST} $svc  ${BLD}Phase:${RST} $phase  ${BLD}Ready:${RST} $ready  ${BLD}Age:${RST} $age_human  ${BLD}Restarts:${RST} $restarts"
+    echo "${color}${BLD}[${status_icon}] Instance ${pod_index}/${total_pods}: ${pod_name}${RST}"
+    echo "    ${BLD}Service:${RST} $svc  ${BLD}State:${RST} $phase  ${BLD}Ready:${RST} $ready  ${BLD}Age:${RST} $age_human  ${BLD}Restarts:${RST} $restarts"
     [[ -n "$detail" ]] && echo "    ${BLD}State:${RST} ${color}${detail}${RST}"
 
     # --- Pod describe (optional) ---
     if [[ "$SHOW_DESCRIBE" == "true" ]]; then
       echo ""
-      echo "    ${BLD}${BLU}--- Pod Describe ---${RST}"
+      echo "    ${BLD}${BLU}--- Full Instance Detail (k8s: pod describe) ---${RST}"
       kube describe pod -n "$ns" -- "$pod_name" 2>/dev/null | sed 's/^/    /'
     fi
 
     # --- Events ---
     if [[ "$SHOW_EVENTS" == "true" ]]; then
       echo ""
-      echo "    ${BLD}${BLU}--- Events ---${RST}"
+      echo "    ${BLD}${BLU}--- Cluster Events (k8s) ---${RST}"
       local events
       events=$(kube get events -n "$ns" \
         --field-selector "involvedObject.name=$pod_name" \
@@ -1582,7 +1623,7 @@ print()
 
     # --- Current container logs ---
     echo ""
-    echo "    ${BLD}${BLU}--- Logs (tail ${LOG_LINES}) ---${RST}"
+    echo "    ${BLD}${BLU}--- Service Logs (last ${LOG_LINES} lines) ---${RST}"
     local logs
     logs=$(kube logs -n "$ns" --all-containers --tail="$LOG_LINES" -- "$pod_name" 2>&1 || true)
     if [[ -n "$logs" ]]; then
@@ -1597,7 +1638,7 @@ print()
       prev_logs=$(kube logs -n "$ns" --all-containers --previous --tail="$LOG_LINES" -- "$pod_name" 2>&1 || true)
       if [[ -n "$prev_logs" ]] && [[ "$prev_logs" != *"previous terminated container"*"not found"* ]]; then
         echo ""
-        echo "    ${BLD}${YEL}--- Previous Container Logs (crashed) ---${RST}"
+        echo "    ${BLD}${YEL}--- Previous Crash Logs ---${RST}"
         echo "$prev_logs" | sed 's/^/    /'
       fi
     fi
@@ -1634,30 +1675,30 @@ main() {
   local ns
   # shellcheck disable=SC2059
   ns=$(printf "$NAMESPACE_FMT" "$RACK" "$APP")
-  info "Checking namespace ${BLD}${ns}${RST}..."
+  info "Checking app namespace ${BLD}${ns}${RST}..."
 
   local ns_check_err
   if ! ns_check_err=$(kube get namespace "$ns" 2>&1); then
-    err "Namespace '$ns' not found on this cluster."
+    err "App namespace '$ns' not found on this cluster."
     if [[ -n "$ns_check_err" ]]; then
       echo "  $ns_check_err" >&2
     fi
     echo "" >&2
-    err "This means the rack name or app name might not match what Kubernetes sees."
+    err "This means the rack name or app name might not match what's on the cluster."
     echo "" >&2
-    echo "  Namespaces on this cluster that look like Convox apps:" >&2
+    echo "  Convox app namespaces on this cluster:" >&2
     kube get ns --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null \
       | grep -v "^kube-" | grep -v "^default$" | sed 's/^/    /' >&2 || true
     echo "" >&2
-    echo "  Expected namespace: ${BLD}${ns}${RST}" >&2
-    echo "  Your rack name ('$RACK') should match the prefix of one of these namespaces." >&2
+    echo "  Expected: ${BLD}${ns}${RST}" >&2
+    echo "  Your rack name ('$RACK') should match the prefix of one of these." >&2
     exit 1
   fi
 
   debug "Namespace $ns exists"
-  deployment_overview
-  check_init_containers
-  collect_diagnostics
+  should_run_check "overview" && deployment_overview || true
+  should_run_check "init"     && check_init_containers || true
+  should_run_check "services"  && collect_diagnostics || true
 }
 
 main "$@"
