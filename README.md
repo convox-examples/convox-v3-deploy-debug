@@ -35,7 +35,7 @@ If you already know your rack and app name, you can skip the wizard:
 - `bash` 4.0+
 - `convox` CLI (logged in to your console)
 - `kubectl` (the interactive wizard configures this for you via `convox rack kubeconfig`)
-- `python3` 3.6+ (used for JSON parsing)
+- `python3` 3.7+ (used for JSON parsing)
 - `curl` (only needed for `--repo` and remote `--convox-yml` URL features)
 - `yq` v4+ (optional, improves convox.yml parsing; grep fallback exists)
 

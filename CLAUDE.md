@@ -122,7 +122,7 @@ These conventions are stable across Convox v3 racks on all supported cloud provi
 
 - `bash` (4.0+, for associative features and `pipefail`)
 - `kubectl` (required, must have cluster access; all calls include `--request-timeout=10s`)
-- `python3` (required, validated at startup; 3.6+ for `datetime.fromisoformat`, used for pod JSON parsing and JSON output escaping)
+- `python3` (required, validated at startup; 3.7+ for `datetime.fromisoformat`, used for pod JSON parsing and JSON output escaping)
 - `curl` (only for `--repo` and remote `--convox-yml` URL features)
 - `yq` v4+ (optional, improves convox.yml parsing, grep fallback exists)
 

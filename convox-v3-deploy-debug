@@ -14,7 +14,7 @@
 #
 # Requirements:
 #   - kubectl (cluster access -- the wizard sets this up automatically)
-#   - python3 (3.6+ for JSON parsing)
+#   - python3 (3.7+ for JSON parsing)
 #   - curl (for remote convox.yml fetching)
 #   - (optional) yq v4+ for reliable convox.yml parsing
 #
@@ -80,7 +80,7 @@ setup_colors() {
 info()  { echo "  ${BLU}${BLD}>${RST} $*" >&2; }
 warn()  { echo "  ${YEL}${BLD}!${RST} ${YEL}$*${RST}" >&2; }
 err()   { echo "  ${RED}${BLD}x${RST} ${RED}$*${RST}" >&2; }
-debug() { [[ "${DEBUG:-}" == "1" ]] && echo "${DIM}    [debug] $*${RST}" >&2 || true; }
+debug() { if [[ "${DEBUG:-}" == "1" ]]; then echo "${DIM}    [debug] $*${RST}" >&2; fi; }
 
 # Unicode box-drawing separator (thin line)
 separator() {
@@ -120,7 +120,11 @@ cleanup() {
     echo "    ${DIM:-}Run with --debug for more detail.${RST:-}" >&2
   fi
   for f in "${CLEANUP_FILES[@]}"; do
-    [[ -f "$f" ]] && rm -f "$f"
+    if [[ -d "$f" ]]; then
+      rm -rf "$f"
+    elif [[ -f "$f" ]]; then
+      rm -f "$f"
+    fi
   done
 }
 trap cleanup EXIT
@@ -297,7 +301,7 @@ validate() {
   fi
   if ! command -v python3 &>/dev/null; then
     err "python3 is required but not found in PATH."
-    err "Python 3.6+ is needed for pod JSON parsing."
+    err "Python 3.7+ is needed for pod JSON parsing."
     exit 1
   fi
   if [[ -n "$REPO_URL" ]] && [[ -n "$CONVOX_YML" ]]; then
@@ -306,6 +310,14 @@ validate() {
   fi
   if [[ -n "$CONVOX_YML" ]] && [[ "$CONVOX_YML" != http* ]] && [[ ! -f "$CONVOX_YML" ]]; then
     err "convox.yml not found at: $CONVOX_YML"
+    exit 1
+  fi
+  if ! [[ "$AGE_SECONDS" =~ ^[0-9]+$ ]] || [[ "$AGE_SECONDS" -le 0 ]]; then
+    err "--age must be a positive integer (got: $AGE_SECONDS)"
+    exit 1
+  fi
+  if ! [[ "$LOG_LINES" =~ ^[0-9]+$ ]] || [[ "$LOG_LINES" -le 0 ]]; then
+    err "--lines must be a positive integer (got: $LOG_LINES)"
     exit 1
   fi
   case "$OUTPUT_MODE" in
@@ -318,6 +330,13 @@ validate() {
       overview|init|services) ;;
       *) err "Invalid check name: $c (use overview, init, or services)"; exit 1 ;;
     esac
+  done
+  local s
+  for s in "${SERVICES[@]}"; do
+    if ! [[ "$s" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]]; then
+      err "Invalid service name: $s (must be alphanumeric, hyphens, dots, and underscores)"
+      exit 1
+    fi
   done
 }
 
@@ -590,7 +609,7 @@ interactive_setup() {
     fi
   else
     warn "Could not fetch kubeconfig:"
-    cat "$kubeconfig_tmp" | sed 's/^/    /' >&2
+    sed 's/^/    /' < "$kubeconfig_tmp" >&2
     warn "Continuing anyway -- kubectl may already be configured for this cluster."
   fi
 
@@ -714,13 +733,6 @@ interactive_setup() {
 kube() {
   # shellcheck disable=SC2086
   kubectl $KUBE_TIMEOUT $KUBECONFIG_ARG $CONTEXT_ARG "$@"
-}
-
-# ---------------------------------------------------------------------------
-# JSON escape via python3 (handles all control characters correctly)
-# ---------------------------------------------------------------------------
-json_escape() {
-  python3 -c "import json,sys; sys.stdout.write(json.dumps(sys.stdin.read()))" <<< "$1"
 }
 
 # ---------------------------------------------------------------------------
@@ -1295,27 +1307,6 @@ collect_diagnostics() {
   # shellcheck disable=SC2059
   ns=$(printf "$NAMESPACE_FMT" "$RACK" "$APP")
 
-  # Verify namespace exists
-  local ns_err
-  if ! ns_err=$(kube get namespace "$ns" 2>&1); then
-    err "App namespace '$ns' not found. Verify rack name '$RACK' and app name '$APP'."
-    if [[ -n "$ns_err" ]]; then
-      echo "    (k8s: $ns_err)" | head -3 | sed 's/^/  /' >&2
-    fi
-    err ""
-    err "Available Convox app namespaces on this cluster:"
-    local avail_ns
-    avail_ns=$(kube get ns --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null | grep -E "^${RACK}-" || true)
-    if [[ -n "$avail_ns" ]]; then
-      echo "$avail_ns" | sed 's/^/  /' >&2
-    else
-      echo "  (none found matching rack '$RACK')" >&2
-    fi
-    err ""
-    err "Check that the rack name matches. Convox creates a namespace named '<rack>-<app>'."
-    exit 1
-  fi
-
   # Build label selector
   local label_selector="system=convox"
   if [[ ${#SERVICES[@]} -eq 1 ]]; then
@@ -1471,7 +1462,29 @@ for pod in data.get('items', []):
 
   if [[ -z "$targets" ]]; then
     if [[ "$OUTPUT_MODE" == "json" ]]; then
-      echo '{"status":"ok","message":"All processes are healthy and past the age threshold.","pods":[]}'
+      python3 -c "
+import json, sys, os
+
+result = {
+    'namespace': sys.argv[1],
+    'rack': sys.argv[2],
+    'app': sys.argv[3],
+    'timestamp': sys.argv[4],
+    'status': 'ok',
+    'message': 'All processes are healthy and past the age threshold.',
+    'pods': []
+}
+
+overview_file = sys.argv[5]
+if overview_file and os.path.exists(overview_file) and os.path.getsize(overview_file) > 0:
+    with open(overview_file) as f:
+        overview = json.load(f)
+    result['services'] = overview.get('services', [])
+    result['resources'] = overview.get('resources', [])
+
+json.dump(result, sys.stdout)
+print()
+" "$ns" "$RACK" "$APP" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$OVERVIEW_JSON_FILE"
     else
       info "All processes are healthy and past the ${AGE_SECONDS}s age threshold."
       info "If you expected to see failing processes, try increasing --age or using --all."
