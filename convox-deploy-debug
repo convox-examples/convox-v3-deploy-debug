@@ -285,9 +285,11 @@ prompt_yes_no() {
   local hint="[Y/n]"
   [[ "$default" == "n" ]] && hint="[y/N]"
 
-  printf '%s %s ' "$prompt_text" "$hint" >&2
+  # Wrap ANSI codes in \001/\002 so readline calculates cursor position correctly
+  local rl_prompt
+  rl_prompt=$(printf '%s %s ' "$prompt_text" "$hint" | sed $'s/\x1b\\[[0-9;]*m/\x01&\x02/g')
   local answer
-  read -r answer < /dev/tty
+  read -erp "$rl_prompt" answer </dev/tty
   answer="${answer:-$default}"
   # bash 4.0+ lowercase
   [[ "${answer,,}" == "y" ]]
@@ -317,8 +319,7 @@ prompt_choice() {
 
   local choice
   while true; do
-    printf 'Enter a number (1-%s): ' "$count" >&2
-    read -r choice < /dev/tty
+    read -erp "Enter a number (1-${count}): " choice </dev/tty
     if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$count" ]]; then
       echo "${options[$((choice - 1))]}"
       return 0
@@ -515,40 +516,31 @@ interactive_setup() {
 
   # -- Step 3: kubectl configuration ---------------------------------------
   echo "" >&2
-  echo "  kubectl needs access to the cluster backing this rack." >&2
-  echo "  This runs: ${DIM}convox rack kubeconfig --rack $convox_rack_full${RST}" >&2
+  info "Setting up temporary kubectl access to rack ${BLD}${convox_rack_full}${RST}..."
+  echo "  Running: ${DIM}convox rack kubeconfig --rack $convox_rack_full${RST}" >&2
+  echo "  This creates a temp kubeconfig for this session only." >&2
+  echo "  To make it permanent:" >&2
+  echo "    ${DIM}convox rack kubeconfig --rack $convox_rack_full > ~/.kube/config${RST}" >&2
   echo "" >&2
 
-  if prompt_yes_no "  Configure kubectl for rack ${BLD}${convox_rack_full}${RST}?"; then
-    info "Fetching kubeconfig from Convox..."
-    local kubeconfig_tmp
-    kubeconfig_tmp=$(mktemp "${TMPDIR:-/tmp}/convox-kubeconfig-XXXXXX")
-    CLEANUP_FILES+=("$kubeconfig_tmp")
+  local kubeconfig_tmp
+  kubeconfig_tmp=$(mktemp "${TMPDIR:-/tmp}/convox-kubeconfig-XXXXXX")
+  CLEANUP_FILES+=("$kubeconfig_tmp")
 
-    if convox rack kubeconfig --rack "$convox_rack_full" > "$kubeconfig_tmp" 2>&1; then
-      # Verify the file looks like valid kubeconfig (has "clusters:" or "apiVersion:")
-      if grep -q "apiVersion\|clusters" "$kubeconfig_tmp" 2>/dev/null; then
-        KUBECONFIG_ARG="--kubeconfig=$kubeconfig_tmp"
-        echo "  ${GRN}[ok]${RST} kubectl configured (using temp kubeconfig)" >&2
-
-        # Offer to save it permanently
-        echo "" >&2
-        echo "  The kubeconfig is saved to a temp file for this session." >&2
-        echo "  To make it permanent, you can save it:" >&2
-        echo "    ${DIM}convox rack kubeconfig --rack $convox_rack_full > ~/.kube/config${RST}" >&2
-      else
-        warn "kubeconfig output does not look valid. Contents:"
-        head -5 "$kubeconfig_tmp" | sed 's/^/    /' >&2
-        warn "Continuing anyway -- kubectl may already be configured for this cluster."
-      fi
+  if convox rack kubeconfig --rack "$convox_rack_full" > "$kubeconfig_tmp" 2>&1; then
+    # Verify the file looks like valid kubeconfig (has "clusters:" or "apiVersion:")
+    if grep -q "apiVersion\|clusters" "$kubeconfig_tmp" 2>/dev/null; then
+      KUBECONFIG_ARG="--kubeconfig=$kubeconfig_tmp"
+      echo "  ${GRN}[ok]${RST} kubectl configured (using temp kubeconfig)" >&2
     else
-      warn "Could not fetch kubeconfig:"
-      cat "$kubeconfig_tmp" | sed 's/^/    /' >&2
+      warn "kubeconfig output does not look valid. Contents:"
+      head -5 "$kubeconfig_tmp" | sed 's/^/    /' >&2
       warn "Continuing anyway -- kubectl may already be configured for this cluster."
     fi
   else
-    echo "  Skipping. Make sure kubectl can reach the cluster." >&2
-    echo "  You can configure it later: ${DIM}convox rack kubeconfig --rack $convox_rack_full > ~/.kube/config${RST}" >&2
+    warn "Could not fetch kubeconfig:"
+    cat "$kubeconfig_tmp" | sed 's/^/    /' >&2
+    warn "Continuing anyway -- kubectl may already be configured for this cluster."
   fi
 
   # -- Quick kubectl connectivity test --------------------------------------
@@ -563,7 +555,7 @@ interactive_setup() {
     echo "    $kube_test_err" | head -5 | sed 's/^/    /' >&2
     echo "" >&2
     err "Possible fixes:"
-    echo "  - Re-run this wizard and choose 'y' at the kubeconfig step" >&2
+    echo "  - Re-run the wizard to retry kubeconfig setup" >&2
     echo "  - Manually configure: convox rack kubeconfig --rack $convox_rack_full > ~/.kube/config" >&2
     echo "  - Check your network connection to the cluster" >&2
     exit 1
@@ -619,9 +611,8 @@ interactive_setup() {
 
   if prompt_yes_no "  Do you have a convox.yml to point to?" "n"; then
     echo "" >&2
-    printf '  Path or URL: ' >&2
     local yml_path
-    read -r yml_path < /dev/tty
+    read -erp '  Path or URL: ' yml_path </dev/tty
     if [[ -n "$yml_path" ]]; then
       CONVOX_YML="$yml_path"
     fi
