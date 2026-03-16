@@ -57,31 +57,56 @@ OVERVIEW_JSON_FILE=""
 
 # Initialize color variables to empty so they're always defined.
 # setup_colors() will set them properly after arg parsing.
-RED="" GRN="" YEL="" BLU="" CYN="" MAG="" BLD="" DIM="" RST=""
+RED="" GRN="" YEL="" BLU="" CYN="" MAG="" BLD="" DIM="" RST="" UND=""
 
 # ---------------------------------------------------------------------------
 # Colors (disabled when piped or --no-color)
 # ---------------------------------------------------------------------------
 setup_colors() {
   if [[ "$NO_COLOR" == "true" ]] || [[ ! -t 1 ]]; then
-    RED="" GRN="" YEL="" BLU="" CYN="" MAG="" BLD="" DIM="" RST=""
+    RED="" GRN="" YEL="" BLU="" CYN="" MAG="" BLD="" DIM="" RST="" UND=""
   else
     RED=$'\033[0;31m' GRN=$'\033[0;32m' YEL=$'\033[0;33m'
     BLU=$'\033[0;34m' CYN=$'\033[0;36m' MAG=$'\033[0;35m'
     BLD=$'\033[1m'    DIM=$'\033[2m'    RST=$'\033[0m'
+    # shellcheck disable=SC2034
+    UND=$'\033[4m'
   fi
 }
 
 # ---------------------------------------------------------------------------
 # Logging helpers
 # ---------------------------------------------------------------------------
-info()  { echo "${BLU}>>>${RST} $*"; }
-warn()  { echo "${YEL}!!! $*${RST}" >&2; }
-err()   { echo "${RED}ERROR: $*${RST}" >&2; }
-debug() { [[ "${DEBUG:-}" == "1" ]] && echo "${DIM}[debug] $*${RST}" >&2 || true; }
+info()  { echo "  ${BLU}${BLD}>${RST} $*" >&2; }
+warn()  { echo "  ${YEL}${BLD}!${RST} ${YEL}$*${RST}" >&2; }
+err()   { echo "  ${RED}${BLD}x${RST} ${RED}$*${RST}" >&2; }
+debug() { [[ "${DEBUG:-}" == "1" ]] && echo "${DIM}    [debug] $*${RST}" >&2 || true; }
 
+# Unicode box-drawing separator (thin line)
 separator() {
-  printf '%s%s%s\n' "$DIM" "$(printf '%.0s-' {1..78})" "$RST"
+  echo "${DIM}  $(printf '%.0s─' {1..74})${RST}"
+}
+
+# Thick double-line separator for major sections
+section_break() {
+  echo "${DIM}  $(printf '%.0s━' {1..74})${RST}"
+}
+
+# Section header with prominent styling
+section_header() {
+  local title="$1"
+  local color="${2:-$MAG}"
+  echo ""
+  echo "  ${color}${BLD}${title}${RST}"
+  separator
+}
+
+# Wizard step header: "  Step 1 of 5 · Dependencies"
+step_header() {
+  local num="$1" total="$2" label="$3"
+  echo "" >&2
+  echo "  ${DIM}Step ${num} of ${total}${RST}  ${BLD}${label}${RST}" >&2
+  echo "" >&2
 }
 
 # ---------------------------------------------------------------------------
@@ -91,8 +116,8 @@ cleanup() {
   local exit_code=$?
   if [[ $exit_code -ne 0 ]] && [[ $exit_code -ne 130 ]]; then
     # If we exited unexpectedly (not Ctrl-C), show the exit code for debugging
-    echo "${RED:-}ERROR: Script exited unexpectedly (exit code $exit_code).${RST:-}" >&2
-    echo "Run with --debug for more detail." >&2
+    echo "  ${RED:-}x Script exited unexpectedly (exit code $exit_code).${RST:-}" >&2
+    echo "    ${DIM:-}Run with --debug for more detail.${RST:-}" >&2
   fi
   for f in "${CLEANUP_FILES[@]}"; do
     [[ -f "$f" ]] && rm -f "$f"
@@ -345,22 +370,22 @@ prompt_choice() {
   fi
 
   echo "" >&2
-  echo "${BLD}${prompt_text}${RST}" >&2
+  echo "  ${BLD}${prompt_text}${RST}" >&2
   echo "" >&2
   local i
   for i in "${!options[@]}"; do
-    echo "  ${BLD}$((i + 1))${RST}) ${options[$i]}" >&2
+    printf '    %s%2d%s  %s\n' "$BLD" "$((i + 1))" "$RST" "${options[$i]}" >&2
   done
   echo "" >&2
 
   local choice
   while true; do
-    read -erp "Enter a number (1-${count}): " choice </dev/tty
+    read -erp "    Pick [1-${count}]: " choice </dev/tty
     if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le "$count" ]]; then
       echo "${options[$((choice - 1))]}"
       return 0
     fi
-    echo "  Invalid choice. Pick a number between 1 and ${count}." >&2
+    echo "    ${DIM}Enter a number between 1 and ${count}.${RST}" >&2
   done
 }
 
@@ -372,77 +397,70 @@ check_interactive_deps() {
   local platform
   platform="$(uname -s)"
 
-  echo "" >&2
-  echo "${BLD}Checking dependencies...${RST}" >&2
-  echo "" >&2
+  local -a ok_deps=() missing_deps=() missing_help=()
 
   # convox CLI
   if command -v convox &>/dev/null; then
-    echo "  ${GRN}[ok]${RST} convox CLI" >&2
+    ok_deps+=("convox CLI")
   else
-    echo "  ${RED}[missing]${RST} convox CLI" >&2
-    echo "" >&2
-    echo "    Install the Convox CLI first:" >&2
+    missing_deps+=("convox CLI")
+    local hint="See: https://docs.convox.com/installation/cli"
     case "$platform" in
-      Darwin)
-        echo "      brew install convox/tap/convox" >&2 ;;
-      Linux)
-        echo "      curl -L https://convox.com/cli/linux/convox -o /usr/local/bin/convox && chmod +x /usr/local/bin/convox" >&2 ;;
-      *)
-        echo "      See: https://docs.convox.com/installation/cli" >&2 ;;
+      Darwin) hint="brew install convox/tap/convox" ;;
+      Linux)  hint="curl -L https://convox.com/cli/linux/convox -o /usr/local/bin/convox && chmod +x /usr/local/bin/convox" ;;
     esac
-    echo "" >&2
-    echo "    Then log in:  convox login <your-console-host>" >&2
+    missing_help+=("convox CLI: $hint")
     all_ok=false
   fi
 
   # kubectl
   if command -v kubectl &>/dev/null; then
-    echo "  ${GRN}[ok]${RST} kubectl" >&2
+    ok_deps+=("kubectl")
   else
-    echo "  ${RED}[missing]${RST} kubectl" >&2
-    echo "" >&2
-    echo "    Install kubectl:" >&2
+    missing_deps+=("kubectl")
+    local hint="See: https://kubernetes.io/docs/tasks/tools/"
     case "$platform" in
-      Darwin)
-        echo "      brew install kubectl" >&2 ;;
-      Linux)
-        echo "      curl -LO \"https://dl.k8s.io/release/\$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\"" >&2
-        echo "      chmod +x kubectl && sudo mv kubectl /usr/local/bin/" >&2 ;;
-      *)
-        echo "      See: https://kubernetes.io/docs/tasks/tools/" >&2 ;;
+      Darwin) hint="brew install kubectl" ;;
+      Linux)  hint="curl -LO \"https://dl.k8s.io/release/\$(curl -sL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl\" && chmod +x kubectl && sudo mv kubectl /usr/local/bin/" ;;
     esac
-    echo "" >&2
-    echo "    Don't worry about configuring it -- this tool will handle that." >&2
+    missing_help+=("kubectl: $hint  (don't worry about configuring it -- this tool handles that)")
     all_ok=false
   fi
 
   # python3
   if command -v python3 &>/dev/null; then
-    echo "  ${GRN}[ok]${RST} python3" >&2
+    ok_deps+=("python3")
   else
-    echo "  ${RED}[missing]${RST} python3" >&2
-    echo "" >&2
-    echo "    Install Python 3.6+:" >&2
+    missing_deps+=("python3")
+    local hint="See: https://www.python.org/downloads/"
     case "$platform" in
-      Darwin)
-        echo "      brew install python3" >&2 ;;
-      Linux)
-        echo "      sudo apt-get install python3   (Debian/Ubuntu)" >&2
-        echo "      sudo yum install python3        (RHEL/CentOS/Amazon Linux)" >&2 ;;
-      *)
-        echo "      See: https://www.python.org/downloads/" >&2 ;;
+      Darwin) hint="brew install python3" ;;
+      Linux)  hint="sudo apt-get install python3 (Debian/Ubuntu) or sudo yum install python3 (RHEL/Amazon Linux)" ;;
     esac
+    missing_help+=("python3: $hint")
     all_ok=false
   fi
 
+  # Render compact status line
+  local dep
+  for dep in "${ok_deps[@]}"; do
+    echo "    ${GRN}${BLD}✓${RST} ${dep}" >&2
+  done
+  for dep in "${missing_deps[@]}"; do
+    echo "    ${RED}${BLD}✗${RST} ${dep}" >&2
+  done
+
   if [[ "$all_ok" == "false" ]]; then
+    echo "" >&2
+    echo "    ${BLD}To install:${RST}" >&2
+    local h
+    for h in "${missing_help[@]}"; do
+      echo "      ${DIM}${h}${RST}" >&2
+    done
     echo "" >&2
     err "Install the missing dependencies above and run this again."
     exit 1
   fi
-
-  echo "" >&2
 }
 
 # ---------------------------------------------------------------------------
@@ -457,13 +475,15 @@ interactive_setup() {
   fi
 
   echo "" >&2
-  echo "${BLD}${CYN}$SCRIPT_NAME v${VERSION}${RST} -- Interactive Setup" >&2
-  separator >&2
+  echo "  ${BLD}${CYN}$SCRIPT_NAME${RST} ${DIM}v${VERSION}${RST}" >&2
+  section_break >&2
 
   # -- Step 1: Check dependencies ------------------------------------------
+  step_header 1 5 "Dependencies"
   check_interactive_deps
 
   # -- Step 2: Rack selection ----------------------------------------------
+  step_header 2 5 "Select Rack"
   info "Fetching available racks..."
   local racks_output
   racks_output=$(convox racks 2>/dev/null || true)
@@ -518,17 +538,15 @@ interactive_setup() {
   fi
 
   if [[ -n "$current_rack" ]]; then
-    echo "  Current rack: ${BLD}${current_rack}${RST}" >&2
+    echo "    ${DIM}Current rack:${RST} ${BLD}${current_rack}${RST}" >&2
   fi
 
   local selected_rack=""
 
   if [[ ${#rack_names[@]} -eq 1 ]]; then
     selected_rack="${rack_names[0]}"
-    echo "" >&2
-    echo "  Only one rack available: ${BLD}${selected_rack}${RST}" >&2
+    echo "    Using ${BLD}${selected_rack}${RST} (only rack available)" >&2
   elif [[ -n "$current_rack" ]]; then
-    echo "" >&2
     if prompt_yes_no "  Use current rack ${BLD}${current_rack}${RST}?"; then
       selected_rack="$current_rack"
     else
@@ -551,12 +569,9 @@ interactive_setup() {
   info "Selected rack: ${BLD}${convox_rack_full}${RST}"
 
   # -- Step 3: kubectl configuration ---------------------------------------
-  echo "" >&2
-  info "Setting up temporary kubectl access to rack ${BLD}${convox_rack_full}${RST}..."
-  echo "  Running: ${DIM}convox rack kubeconfig --rack $convox_rack_full${RST}" >&2
-  echo "  This creates a temp kubeconfig for this session only." >&2
-  echo "  To make it permanent:" >&2
-  echo "    ${DIM}convox rack kubeconfig --rack $convox_rack_full > ~/.kube/config${RST}" >&2
+  step_header 3 5 "Cluster Access"
+  info "Setting up temporary cluster access for ${BLD}${convox_rack_full}${RST}..."
+  echo "    ${DIM}Running: convox rack kubeconfig --rack $convox_rack_full${RST}" >&2
   echo "" >&2
 
   local kubeconfig_tmp
@@ -567,7 +582,7 @@ interactive_setup() {
     # Verify the file looks like valid kubeconfig (has "clusters:" or "apiVersion:")
     if grep -q "apiVersion\|clusters" "$kubeconfig_tmp" 2>/dev/null; then
       KUBECONFIG_ARG="--kubeconfig=$kubeconfig_tmp"
-      echo "  ${GRN}[ok]${RST} kubectl configured (using temp kubeconfig)" >&2
+      echo "    ${GRN}${BLD}✓${RST} Cluster access configured (session only)" >&2
     else
       warn "kubeconfig output does not look valid. Contents:"
       head -5 "$kubeconfig_tmp" | sed 's/^/    /' >&2
@@ -579,26 +594,26 @@ interactive_setup() {
     warn "Continuing anyway -- kubectl may already be configured for this cluster."
   fi
 
-  # -- Quick kubectl connectivity test --------------------------------------
-  echo "" >&2
-  info "Testing kubectl connectivity..."
+  # -- Quick connectivity test ------------------------------------------------
+  info "Testing cluster connectivity..."
   local kube_test_err
+  # shellcheck disable=SC2086
   if kube_test_err=$(kubectl $KUBE_TIMEOUT $KUBECONFIG_ARG get namespaces --no-headers -o custom-columns=NAME:.metadata.name 2>&1); then
-    echo "  ${GRN}[ok]${RST} kubectl can reach the cluster" >&2
+    echo "    ${GRN}${BLD}✓${RST} Connected to cluster" >&2
   else
     echo "" >&2
-    err "kubectl cannot reach the cluster."
-    echo "    $kube_test_err" | head -5 | sed 's/^/    /' >&2
+    err "Cannot reach the cluster."
+    echo "      ${DIM}$kube_test_err${RST}" | head -3 >&2
     echo "" >&2
-    err "Possible fixes:"
-    echo "  - Re-run the wizard to retry kubeconfig setup" >&2
-    echo "  - Manually configure: convox rack kubeconfig --rack $convox_rack_full > ~/.kube/config" >&2
-    echo "  - Check your network connection to the cluster" >&2
+    echo "    ${BLD}Things to try:${RST}" >&2
+    echo "      ${DIM}- Re-run this wizard to retry${RST}" >&2
+    echo "      ${DIM}- Manually configure: convox rack kubeconfig --rack $convox_rack_full > ~/.kube/config${RST}" >&2
+    echo "      ${DIM}- Check your network connection${RST}" >&2
     exit 1
   fi
 
   # -- Step 4: App selection -----------------------------------------------
-  echo "" >&2
+  step_header 4 5 "Select App"
   info "Fetching apps on rack ${BLD}${convox_rack_full}${RST}..."
   local apps_output
   apps_output=$(convox apps --rack "$convox_rack_full" 2>/dev/null || true)
@@ -630,8 +645,7 @@ interactive_setup() {
 
   if [[ ${#app_names[@]} -eq 1 ]]; then
     selected_app="${app_names[0]}"
-    echo "" >&2
-    echo "  Only one app available: ${BLD}${selected_app}${RST}" >&2
+    echo "    Using ${BLD}${selected_app}${RST} (only app available)" >&2
   else
     selected_app=$(prompt_choice "Select an app to debug:" "${app_names[@]}")
   fi
@@ -640,53 +654,55 @@ interactive_setup() {
   info "Selected app: ${BLD}${APP}${RST}"
 
   # -- Step 5: Optional convox.yml -----------------------------------------
-  echo "" >&2
-  echo "  A convox.yml helps discover your service names for better output." >&2
-  echo "  This is optional -- the tool works without it." >&2
+  step_header 5 5 "Service Discovery (optional)"
+  echo "    ${DIM}A convox.yml helps discover your service names for better output.${RST}" >&2
+  echo "    ${DIM}The tool works fine without it.${RST}" >&2
   echo "" >&2
 
   if prompt_yes_no "  Do you have a convox.yml to point to?" "n"; then
     echo "" >&2
     local yml_path
-    read -erp '  Path or URL: ' yml_path </dev/tty
+    read -erp '    Path or URL: ' yml_path </dev/tty
     if [[ -n "$yml_path" ]]; then
       CONVOX_YML="$yml_path"
     fi
   fi
 
-  # -- Step 6: Confirm and run ---------------------------------------------
+  # -- Confirm and run ------------------------------------------------------
   echo "" >&2
-  separator >&2
+  section_break >&2
   echo "" >&2
-  echo "${BLD}Ready to run diagnostics:${RST}" >&2
-  echo "  Rack:  ${BLD}${convox_rack_full}${RST} (namespace prefix: ${RACK})" >&2
-  echo "  App:   ${BLD}${APP}${RST}" >&2
+  echo "  ${BLD}Ready to run diagnostics${RST}" >&2
+  echo "" >&2
+  echo "    Rack      ${BLD}${convox_rack_full}${RST}" >&2
+  echo "    App       ${BLD}${APP}${RST}" >&2
   if [[ -n "$CONVOX_YML" ]]; then
-    echo "  Manifest: ${BLD}${CONVOX_YML}${RST}" >&2
+    echo "    Manifest  ${BLD}${CONVOX_YML}${RST}" >&2
   fi
   echo "" >&2
 
-  # Show the equivalent CLI command for future use (skip temp kubeconfig --
-  # the user should save their kubeconfig permanently instead)
+  # Show the equivalent CLI command for future use
   local cmd="./$SCRIPT_NAME --rack ${RACK} --app ${APP}"
   [[ -n "$CONVOX_YML" ]] && cmd+=" --convox-yml ${CONVOX_YML}"
-  echo "  ${DIM}Tip: next time you can skip this wizard with:${RST}" >&2
+  separator >&2
+  echo "  ${DIM}Quick-run (skip this wizard next time):${RST}" >&2
   echo "    ${BLD}${cmd}${RST}" >&2
   echo "" >&2
-  echo "  ${DIM}To run only specific checks, add -c (repeatable):${RST}" >&2
-  echo "    ${DIM}${cmd} -c services${RST}           ${DIM}# just service instance logs and classification${RST}" >&2
-  echo "    ${DIM}${cmd} -c overview -c init${RST}   ${DIM}# rollout status + init containers${RST}" >&2
-  echo "    ${DIM}Available checks: overview, init, services${RST}" >&2
+  echo "  ${DIM}Run specific checks only (-c, repeatable, combine as needed):${RST}" >&2
+  echo "    ${DIM}-c services${RST}    service instance logs and classification" >&2
+  echo "    ${DIM}-c overview${RST}    service rollout status and events" >&2
+  echo "    ${DIM}-c init${RST}        init container detection" >&2
+  echo "" >&2
+  echo "    ${DIM}Example: ${cmd} -c overview -c services${RST}" >&2
+  separator >&2
   echo "" >&2
 
   if ! prompt_yes_no "  Run diagnostics now?"; then
     echo "" >&2
-    info "Exiting. Use the command above when you're ready."
+    info "Exiting. Use the commands above when you're ready."
     exit 0
   fi
 
-  echo "" >&2
-  info "Starting diagnostics..."
   echo "" >&2
   # RACK, APP, CONVOX_YML, and KUBECONFIG_ARG are now set.
   # Control returns to main() which calls validate() and continues.
@@ -941,7 +957,8 @@ with open(os.environ['ENDPOINTS_FILE']) as f:
     endpoints = json.load(f)
 
 output_mode = os.environ['OUT_MODE']
-DIV = DIM + '-' * 78 + RST
+DIV = DIM + '  ' + '─' * 74 + RST
+HDIV = DIM + '  ' + '━' * 74 + RST
 
 # ---------- build service + resource lists ----------
 services = []
@@ -1112,7 +1129,7 @@ if not services and not resources:
 # -- service rollout status --
 if services:
     print()
-    print(f'{BLD}{MAG}SERVICE STATUS{RST}')
+    print(f'  {MAG}{BLD}SERVICE STATUS{RST}')
     print(DIV)
     for s in services:
         name = s['name']
@@ -1123,50 +1140,50 @@ if services:
         agent = s.get('agent', False)
 
         if status == 'running':
-            tag, color = f'{GRN}[RUNNING]{RST}', GRN
+            icon, color = f'{GRN}●{RST}', GRN
         elif status == 'stalled':
-            tag, color = f'{RED}[STALLED]{RST}', RED
+            icon, color = f'{RED}●{RST}', RED
         elif status == 'deploying':
-            tag, color = f'{YEL}[DEPLOYING]{RST}', YEL
+            icon, color = f'{YEL}●{RST}', YEL
         else:
-            tag, color = f'{DIM}[{status.upper()}]{RST}', DIM
+            icon, color = f'{DIM}○{RST}', DIM
 
-        stype = ' (agent)' if agent else ''
+        stype = f' {DIM}(agent){RST}' if agent else ''
         pword = 'instance' if des == 1 else 'instances'
         body = f'{rdy}/{des} {pword} ready'
-        pad = max(1, 68 - len(name) - len(body) - len(stype))
-        print(f'  {BLD}{name}{RST}{stype}  {color}{body}{RST}{" " * pad}{tag}')
+        status_label = status.upper()
+        print(f'  {icon} {BLD}{name}{RST}{stype}  {color}{body}{RST}  {color}{status_label}{RST}')
 
         if stall_msg:
-            print(f'    {RED}{stall_msg}{RST}')
+            print(f'      {RED}{stall_msg}{RST}')
         if traffic is False and status != 'scaled down':
-            print(f'    {YEL}Not receiving traffic -- no instances passing health checks yet{RST}')
+            print(f'      {YEL}Not receiving traffic -- no instances passing health checks yet{RST}')
             if output_mode != 'summary':
-                print(f'    {DIM}Check health.path in convox.yml matches a responding endpoint{RST}')
+                print(f'      {DIM}Check health.path in convox.yml matches a responding endpoint{RST}')
         if status in ('stalled', 'deploying') and not stall_msg:
             if output_mode != 'summary':
-                print(f'    {DIM}Tip: check service logs below for crash details or health check failures{RST}')
+                print(f'      {DIM}Check service logs below for crash details or health check failures{RST}')
     print(DIV)
 
 # -- resource health --
 if resources:
     print()
-    print(f'{BLD}{MAG}RESOURCE STATUS{RST}')
+    print(f'  {MAG}{BLD}RESOURCE STATUS{RST}')
     print(DIV)
     for r in resources:
         name, rdy, des = r['name'], r['ready'], r['desired']
         status = r['status']
         if status == 'running':
-            tag = f'{GRN}[OK]{RST}'
+            icon, color = f'{GRN}●{RST}', GRN
         elif rdy == 0 and des > 0:
-            tag = f'{RED}[DOWN]{RST}'
+            icon, color = f'{RED}●{RST}', RED
         else:
-            tag = f'{YEL}[DEGRADED]{RST}'
+            icon, color = f'{YEL}●{RST}', YEL
         body = f'{rdy}/{des} running'
-        pad = max(1, 68 - len(name) - len(body))
-        print(f'  {BLD}{name}{RST}  {body}{" " * pad}{tag}')
+        status_label = 'OK' if status == 'running' else ('DOWN' if rdy == 0 and des > 0 else 'DEGRADED')
+        print(f'  {icon} {BLD}{name}{RST}  {body}  {color}{status_label}{RST}')
         if rdy == 0 and des > 0:
-            print(f'    {DIM}Services depending on this resource may fail to connect{RST}')
+            print(f'      {DIM}Services depending on this resource may fail to connect{RST}')
     print(DIV)
 
 # -- deploy events (warnings from Deployments / ReplicaSets) --
@@ -1180,21 +1197,21 @@ if svc_events:
             unique.append(e)
     if unique:
         print()
-        print(f'{BLD}{YEL}SERVICE EVENTS{RST}')
+        print(f'  {YEL}{BLD}SERVICE EVENTS{RST}')
         print(DIV)
         for e in unique[:15]:
             msg = e['message']
             raw = e.get('raw', '')
-            print(f'  {YEL}{e["service"]}{RST}  {msg}')
+            print(f'  {YEL}!{RST} {BLD}{e["service"]}{RST}  {msg}')
             if raw and raw != msg:
                 if len(raw) > 120:
                     raw = raw[:117] + '...'
-                print(f'    {DIM}{raw}{RST}')
+                print(f'      {DIM}{raw}{RST}')
         print(DIV)
 
 if output_mode == 'summary':
     print()
-    print(f'{DIM}Use terminal mode (-o terminal) for full service logs.{RST}')
+    print(f'  {DIM}Use terminal mode (-o terminal) for full service logs.{RST}')
 OVERVIEW_PYEOF
 }
 
@@ -1229,43 +1246,41 @@ check_init_containers() {
   fi
 
   if [[ "$OUTPUT_MODE" == "summary" ]]; then
-    echo ""
-    echo "${BLD}${YEL}INIT CONTAINER ISSUES DETECTED${RST}"
-    separator
+    section_header "INIT CONTAINER ISSUES" "$YEL"
     while read -r line; do
       local pod_name pod_status
       pod_name=$(echo "$line" | awk '{print $1}')
       pod_status=$(echo "$line" | awk '{print $3}')
-      echo "${YEL}Instance:${RST} $pod_name  ${YEL}Status:${RST} $pod_status"
+      echo "  ${YEL}!${RST} ${BLD}${pod_name}${RST}  ${DIM}status:${RST} $pod_status"
     done <<< "$init_pods"
     separator
-    echo "${DIM}Use terminal mode (-o terminal) for init container logs.${RST}"
+    echo "  ${DIM}Use terminal mode (-o terminal) for init container logs.${RST}"
     echo ""
     return
   fi
 
   # Terminal mode: full init container logs
-  echo ""
-  echo "${BLD}${YEL}INIT CONTAINER ISSUES DETECTED${RST}"
-  separator
+  section_header "INIT CONTAINER ISSUES" "$YEL"
   while read -r line; do
     local pod_name
     pod_name=$(echo "$line" | awk '{print $1}')
-    echo "${YEL}Instance (k8s: pod):${RST} $pod_name"
-    echo "${YEL}Status:${RST} $(echo "$line" | awk '{print $3}')"
     echo ""
-    echo "    ${BLD}Init Container Logs:${RST}"
+    echo "  ${YEL}!${RST} ${BLD}${pod_name}${RST}"
+    echo "    ${DIM}Status:${RST} $(echo "$line" | awk '{print $3}')"
+    echo ""
     # Fetch logs from all init containers, not just one named "init"
     local init_container_names
     init_container_names=$(kube get pod "$pod_name" -n "$ns" \
       -o jsonpath='{.spec.initContainers[*].name}' 2>/dev/null || true)
     if [[ -n "$init_container_names" ]]; then
       for ic_name in $init_container_names; do
-        echo "    ${DIM}[container: ${ic_name}]${RST}"
+        echo "    ${DIM}─── init container: ${ic_name} ───${RST}"
         kube logs -n "$ns" -c "$ic_name" --tail=50 -- "$pod_name" 2>&1 | sed 's/^/    /' || true
+        echo ""
       done
     else
       # Fallback: try --all-containers
+      echo "    ${DIM}─── init container logs ───${RST}"
       kube logs -n "$ns" --all-containers --tail=50 -- "$pod_name" 2>&1 | sed 's/^/    /' || true
     fi
     separator
@@ -1533,30 +1548,30 @@ print()
   # -----------------------------------------------------------------------
   if [[ "$OUTPUT_MODE" == "summary" ]]; then
     echo ""
-    echo "${BLD}Deploy Debug Summary${RST}  ${DIM}${RACK}/${APP}  $(date -u +%Y-%m-%dT%H:%M:%SZ)${RST}"
-    separator
-    # Use echo for the header to avoid printf color/width issues
-    echo "${BLD}INSTANCE (K8S: POD)                            SERVICE    STATUS       READY  RESTARTS DETAIL${RST}"
+    echo "  ${BLD}Deploy Debug Summary${RST}  ${DIM}${RACK}/${APP}  $(date -u +%Y-%m-%dT%H:%M:%SZ)${RST}"
+    section_break
+    echo ""
+    echo "  ${BLD}INSTANCE                                       SERVICE    STATUS       READY  RESTARTS DETAIL${RST}"
     separator
     while IFS='|' read -r pod_name svc phase ready age_sec restarts classification detail; do
       [[ -z "$pod_name" ]] && continue
-      local color="$RST"
+      local icon="$RST"
       case "$classification" in
-        unhealthy) color="$RED" ;;
-        not-ready) color="$YEL" ;;
-        new)       color="$CYN" ;;
+        unhealthy) icon="${RED}●${RST}" ;;
+        not-ready) icon="${YEL}●${RST}" ;;
+        new)       icon="${CYN}●${RST}" ;;
+        *)         icon="${GRN}●${RST}" ;;
       esac
       local age_human="${age_sec}s"
       if [[ "$age_sec" -ge 60 ]]; then
         age_human="$((age_sec / 60))m$((age_sec % 60))s"
       fi
-      # Use echo with manually padded fields to avoid printf color/width issues
-      printf '%s%-45s %-10s %-12s %-6s %-8s %s%s\n' \
-        "$color" "$pod_name" "$svc" "$phase($age_human)" "$ready" "$restarts" "$detail" "$RST"
+      printf '  %s %-44s %-10s %-12s %-6s %-8s %s\n' \
+        "$icon" "$pod_name" "$svc" "$phase($age_human)" "$ready" "$restarts" "$detail"
     done <<< "$targets"
     separator
     echo ""
-    echo "${DIM}Use terminal mode (-o terminal) for full service logs.${RST}"
+    echo "  ${DIM}Use terminal mode (-o terminal) for full service logs.${RST}"
     return
   fi
 
@@ -1568,10 +1583,12 @@ print()
   total_pods=$(printf '%s\n' "$targets" | grep -c .)
 
   echo ""
-  echo "${BLD}${MAG}CONVOX DEPLOY DEBUG${RST}  ${DIM}v${VERSION}${RST}"
-  echo "${BLD}Rack:${RST} $RACK  ${BLD}App:${RST} $APP  ${BLD}Namespace (k8s):${RST} $ns"
-  echo "${BLD}Time:${RST} $(date -u +%Y-%m-%dT%H:%M:%SZ)  ${BLD}Age threshold:${RST} ${AGE_SECONDS}s"
-  echo "${BLD}Service instances:${RST} $total_pods"
+  echo "  ${BLD}${MAG}CONVOX DEPLOY DEBUG${RST}  ${DIM}v${VERSION}${RST}"
+  section_break
+  echo ""
+  echo "    Rack  ${BLD}$RACK${RST}    App  ${BLD}$APP${RST}    ${DIM}namespace: $ns${RST}"
+  echo "    Time  ${DIM}$(date -u +%Y-%m-%dT%H:%M:%SZ)${RST}    Age threshold  ${DIM}${AGE_SECONDS}s${RST}    Instances  ${BLD}$total_pods${RST}"
+  echo ""
   separator
 
   while IFS='|' read -r pod_name svc phase ready age_sec restarts classification detail; do
@@ -1580,10 +1597,10 @@ print()
 
     local color="$RST" status_icon=""
     case "$classification" in
-      unhealthy) color="$RED"; status_icon="X" ;;
-      not-ready) color="$YEL"; status_icon="!" ;;
-      new)       color="$CYN"; status_icon="*" ;;
-      healthy)   color="$GRN"; status_icon="+" ;;
+      unhealthy) color="$RED"; status_icon="${RED}●${RST}" ;;
+      not-ready) color="$YEL"; status_icon="${YEL}●${RST}" ;;
+      new)       color="$CYN"; status_icon="${CYN}●${RST}" ;;
+      healthy)   color="$GRN"; status_icon="${GRN}●${RST}" ;;
     esac
 
     local age_human="${age_sec}s"
@@ -1592,21 +1609,22 @@ print()
     fi
 
     echo ""
-    echo "${color}${BLD}[${status_icon}] Instance ${pod_index}/${total_pods}: ${pod_name}${RST}"
-    echo "    ${BLD}Service:${RST} $svc  ${BLD}State:${RST} $phase  ${BLD}Ready:${RST} $ready  ${BLD}Age:${RST} $age_human  ${BLD}Restarts:${RST} $restarts"
-    [[ -n "$detail" ]] && echo "    ${BLD}State:${RST} ${color}${detail}${RST}"
+    echo "  ${status_icon} ${BLD}Instance ${pod_index}/${total_pods}${RST}  ${color}${classification}${RST}"
+    echo "    ${DIM}name:${RST}    ${pod_name}"
+    echo "    ${DIM}service:${RST} ${BLD}${svc}${RST}    ${DIM}state:${RST} ${phase}    ${DIM}ready:${RST} ${ready}    ${DIM}age:${RST} ${age_human}    ${DIM}restarts:${RST} ${restarts}"
+    [[ -n "$detail" ]] && echo "    ${DIM}detail:${RST}  ${color}${detail}${RST}"
 
     # --- Pod describe (optional) ---
     if [[ "$SHOW_DESCRIBE" == "true" ]]; then
       echo ""
-      echo "    ${BLD}${BLU}--- Full Instance Detail (k8s: pod describe) ---${RST}"
-      kube describe pod -n "$ns" -- "$pod_name" 2>/dev/null | sed 's/^/    /'
+      echo "    ${DIM}─── full instance detail (k8s: pod describe) ───${RST}"
+      kube describe pod -n "$ns" -- "$pod_name" 2>/dev/null | sed 's/^/      /'
     fi
 
     # --- Events ---
     if [[ "$SHOW_EVENTS" == "true" ]]; then
       echo ""
-      echo "    ${BLD}${BLU}--- Cluster Events (k8s) ---${RST}"
+      echo "    ${DIM}─── cluster events ───${RST}"
       local events
       events=$(kube get events -n "$ns" \
         --field-selector "involvedObject.name=$pod_name" \
@@ -1615,31 +1633,31 @@ print()
         -o custom-columns='TIME:.lastTimestamp,TYPE:.type,REASON:.reason,MESSAGE:.message' \
         2>/dev/null || true)
       if [[ -n "$events" ]]; then
-        echo "$events" | sed 's/^/    /'
+        echo "$events" | sed 's/^/      /'
       else
-        echo "    ${DIM}(no events found)${RST}"
+        echo "      ${DIM}(no events)${RST}"
       fi
     fi
 
     # --- Current container logs ---
     echo ""
-    echo "    ${BLD}${BLU}--- Service Logs (last ${LOG_LINES} lines) ---${RST}"
+    echo "    ${DIM}─── service logs (last ${LOG_LINES} lines) ───${RST}"
     local logs
     logs=$(kube logs -n "$ns" --all-containers --tail="$LOG_LINES" -- "$pod_name" 2>&1 || true)
     if [[ -n "$logs" ]]; then
-      echo "$logs" | sed 's/^/    /'
+      echo "$logs" | sed 's/^/      /'
     else
-      echo "    ${DIM}(no logs available)${RST}"
+      echo "      ${DIM}(no logs available)${RST}"
     fi
 
-    # --- Previous container logs (for CrashLoopBackOff) ---
+    # --- Previous container logs (for crash loops) ---
     if [[ "$SHOW_PREVIOUS" == "true" ]]; then
       local prev_logs
       prev_logs=$(kube logs -n "$ns" --all-containers --previous --tail="$LOG_LINES" -- "$pod_name" 2>&1 || true)
       if [[ -n "$prev_logs" ]] && [[ "$prev_logs" != *"previous terminated container"*"not found"* ]]; then
         echo ""
-        echo "    ${BLD}${YEL}--- Previous Crash Logs ---${RST}"
-        echo "$prev_logs" | sed 's/^/    /'
+        echo "    ${YEL}─── previous crash logs ───${RST}"
+        echo "$prev_logs" | sed 's/^/      /'
       fi
     fi
 
@@ -1647,7 +1665,7 @@ print()
   done <<< "$targets"
 
   echo ""
-  echo "${BLD}Legend:${RST}  ${RED}[X] Unhealthy${RST}  ${YEL}[!] Not Ready${RST}  ${CYN}[*] New${RST}  ${GRN}[+] Healthy${RST}"
+  echo "  ${RED}●${RST} Unhealthy   ${YEL}●${RST} Not Ready   ${CYN}●${RST} New   ${GRN}●${RST} Healthy"
   echo ""
 }
 
@@ -1696,9 +1714,9 @@ main() {
   fi
 
   debug "Namespace $ns exists"
-  should_run_check "overview" && deployment_overview || true
-  should_run_check "init"     && check_init_containers || true
-  should_run_check "services"  && collect_diagnostics || true
+  if should_run_check "overview"; then deployment_overview; fi
+  if should_run_check "init"; then check_init_containers; fi
+  if should_run_check "services"; then collect_diagnostics; fi
 }
 
 main "$@"

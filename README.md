@@ -1,12 +1,12 @@
 # convox-deploy-debug
 
-Diagnostic tool for capturing pre-healthcheck pod logs during Convox deployments.
+Diagnostic tool for capturing pre-healthcheck service logs during Convox deployments.
 
-`convox logs` does not surface pod output until containers pass their health check. Most deploy failures happen before that point. This script bridges the gap by querying kubectl directly using Convox's namespace and label conventions.
+`convox logs` does not surface service output until instances pass their health check. Most deploy failures happen before that point. This script bridges the gap by querying the cluster directly using Convox's namespace and label conventions.
 
 ## Quick Start
 
-The easiest way to get started is the interactive guided mode. It checks your dependencies, lets you pick a rack and app from a menu, and configures kubectl for you:
+The easiest way to get started is the interactive guided mode. It checks your dependencies, lets you pick a rack and app from a menu, and configures cluster access for you:
 
 ```bash
 # Download and make executable
@@ -20,7 +20,7 @@ The wizard will:
 
 1. Check that `convox`, `kubectl`, and `python3` are installed (with install instructions if anything is missing)
 2. Show your available racks and let you pick one
-3. Configure kubectl to talk to that rack's cluster
+3. Configure cluster access for that rack (temporary, session only)
 4. List your apps and let you pick one to debug
 5. Run the diagnostics
 
@@ -34,8 +34,8 @@ If you already know your rack and app name, you can skip the wizard:
 
 - `bash` 4.0+
 - `convox` CLI (logged in to your console)
-- `kubectl` (the interactive wizard can configure this for you via `convox rack kubeconfig`)
-- `python3` 3.6+ (used for pod JSON parsing)
+- `kubectl` (the interactive wizard configures this for you via `convox rack kubeconfig`)
+- `python3` 3.6+ (used for JSON parsing)
 - `curl` (only needed for `--repo` and remote `--convox-yml` URL features)
 - `yq` v4+ (optional, improves convox.yml parsing; grep fallback exists)
 
@@ -72,18 +72,40 @@ For private repos, clone locally and use `--convox-yml <path>` instead of `--rep
 
 | Flag | Description |
 |------|-------------|
-| `-A, --age <seconds>` | Pod age threshold in seconds (default: 300) |
-| `--all` | Include all pods, not just unhealthy/new ones |
+| `-A, --age <seconds>` | Service instance age threshold in seconds (default: 300) |
+| `--all` | Include all service instances, not just unhealthy/new ones |
+| `-c, --checks <name>` | Run only specific diagnostic checks (repeatable, see below) |
+
+### Diagnostic Checks (`-c`)
+
+By default all three checks run. Use `-c` to run only specific ones. The flag is repeatable -- combine as needed.
+
+| Check | What it does |
+|-------|-------------|
+| `overview` | Service rollout status, resource health, and deploy events |
+| `init` | Detects service instances stuck on init containers |
+| `services` | Per-instance logs, cluster events, and instance classification |
+
+```bash
+# Run only the service instance check
+./convox-deploy-debug -r production -a myapp -c services
+
+# Run rollout overview and init container checks together
+./convox-deploy-debug -r production -a myapp -c overview -c init
+
+# All three (default behavior, same as omitting -c)
+./convox-deploy-debug -r production -a myapp -c overview -c init -c services
+```
 
 ### Output
 
 | Flag | Description |
 |------|-------------|
 | `-o, --output <mode>` | Output mode: `terminal`, `summary`, `json` (default: `terminal`) |
-| `-n, --lines <count>` | Number of log lines per pod (default: 200) |
-| `--no-events` | Skip pod events |
-| `--no-previous` | Skip logs from previous (crashed) containers |
-| `--describe` | Include full `kubectl describe pod` output |
+| `-n, --lines <count>` | Number of log lines per service instance (default: 200) |
+| `--no-events` | Skip cluster events |
+| `--no-previous` | Skip logs from previous crashes |
+| `--describe` | Include full instance detail (k8s: pod describe) |
 | `--no-color` | Disable colored output |
 
 ### Cluster
@@ -106,36 +128,36 @@ For private repos, clone locally and use `--convox-yml <path>` instead of `--rep
 
 ### terminal (default)
 
-Full diagnostic output with color-coded pod status, logs, events, and previous container logs. Best for interactive debugging.
+Full diagnostic output with color-coded instance status, logs, events, and previous crash logs. Best for interactive debugging.
 
 ### summary
 
-Compact table view showing pod name, service, status, readiness, restart count, and state detail. Good for quick triage when you need to identify which pods are failing.
+Compact table view showing instance name, service, status, readiness, restart count, and state detail. Good for quick triage when you need to identify which instances are failing.
 
 ### json
 
-Machine-readable JSON output with all pod data, logs, events, and classification. Pipe to `jq` for filtering or integrate into CI/CD pipelines.
+Machine-readable JSON output with all instance data, logs, events, and classification. Pipe to `jq` for filtering or integrate into CI/CD pipelines.
 
 ```bash
-# Get just the unhealthy pods
+# Get just the unhealthy instances
 ./convox-deploy-debug -r prod -a myapp -o json | jq '.pods[] | select(.classification == "unhealthy")'
 
-# Get pod names and their state
+# Get instance names and their state
 ./convox-deploy-debug -r prod -a myapp -o json | jq '.pods[] | {name, classification, stateDetail}'
 ```
 
-## Pod Classification
+## Instance Classification
 
-The script classifies each pod into one of four categories:
+Each service instance (k8s: pod) is classified into one of four categories:
 
 | Classification | Meaning | Terminal Icon |
 |---------------|---------|---------------|
-| **unhealthy** | Pod phase is not `Running` (e.g., `Pending`, `Failed`, `CrashLoopBackOff`) | `[X]` (red) |
-| **not-ready** | Pod is `Running` but has not passed readiness checks | `[!]` (yellow) |
-| **new** | Pod is `Running` and ready, but younger than the age threshold | `[*]` (cyan) |
-| **healthy** | Pod is `Running`, ready, and older than the age threshold | `[+]` (green) |
+| **unhealthy** | Instance is not running (e.g., `Pending`, `Failed`, crash loop) | red `●` |
+| **not-ready** | Instance is running but has not passed health checks | yellow `●` |
+| **new** | Instance is running and ready, but younger than the age threshold | cyan `●` |
+| **healthy** | Instance is running, ready, and older than the age threshold | green `●` |
 
-By default, only unhealthy, not-ready, and new pods are shown. Use `--all` to include healthy pods.
+By default, only unhealthy, not-ready, and new instances are shown. Use `--all` to include healthy instances.
 
 ## Repo URL Format
 
@@ -184,13 +206,19 @@ git@github.com:org/repo.git
 # Summary mode for quick triage
 ./convox-deploy-debug -r production -a myapp -o summary
 
+# Run only the rollout overview check
+./convox-deploy-debug -r production -a myapp -c overview
+
+# Run service instance diagnostics and init checks together
+./convox-deploy-debug -r production -a myapp -c services -c init
+
 # Use a specific kubeconfig and context
 ./convox-deploy-debug -r production -a myapp --kubeconfig ~/.kube/prod --context prod-cluster
 
-# Include full pod describe output
+# Include full instance detail (k8s: pod describe)
 ./convox-deploy-debug -r production -a myapp --describe
 
-# Show all pods including healthy ones
+# Show all instances including healthy ones
 ./convox-deploy-debug -r production -a myapp --all
 ```
 
@@ -201,58 +229,72 @@ Running the script with no arguments (or with `--setup`) starts an interactive w
 ```
 $ ./convox-deploy-debug
 
-convox-deploy-debug v1.2.0 -- Interactive Setup
-------------------------------------------------------------------------------
+  convox-deploy-debug v1.2.0
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Checking dependencies...
+  Step 1 of 5  Dependencies
 
-  [ok] convox CLI
-  [ok] kubectl
-  [ok] python3
+    ✓ convox CLI
+    ✓ kubectl
+    ✓ python3
 
->>> Checking current Convox rack...
-  Current rack: production
+  Step 2 of 5  Select Rack
 
->>> Fetching available racks...
+  > Fetching available racks...
+    Current rack: production
 
   Use current rack production? [Y/n] y
->>> Selected rack: production
+  > Selected rack: production
 
-  kubectl needs access to the cluster backing this rack.
-  This runs: convox rack kubeconfig --rack production
+  Step 3 of 5  Cluster Access
 
-  Configure kubectl for rack production? [Y/n] y
->>> Fetching kubeconfig from Convox...
-  [ok] kubectl configured (using temp kubeconfig)
+  > Setting up temporary cluster access for production...
+    Running: convox rack kubeconfig --rack production
 
->>> Fetching apps on rack production...
+    ✓ Cluster access configured (session only)
+  > Testing cluster connectivity...
+    ✓ Connected to cluster
 
-Select an app to debug:
+  Step 4 of 5  Select App
 
-  1) myapp
-  2) api-gateway
-  3) worker-pool
+  > Fetching apps on rack production...
 
-Enter a number (1-3): 1
->>> Selected app: myapp
+  Select an app to debug:
 
-  A convox.yml helps discover your service names for better output.
-  This is optional -- the tool works without it.
+     1  myapp
+     2  api-gateway
+     3  worker-pool
+
+    Pick [1-3]: 1
+  > Selected app: myapp
+
+  Step 5 of 5  Service Discovery (optional)
+
+    A convox.yml helps discover your service names for better output.
+    The tool works fine without it.
 
   Do you have a convox.yml to point to? [y/N] n
 
-------------------------------------------------------------------------------
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Ready to run diagnostics:
-  Rack:  production
-  App:   myapp
+  Ready to run diagnostics
 
-  Tip: next time you can skip this wizard with:
+    Rack      production
+    App       myapp
+
+  ──────────────────────────────────────────────────────────────────────────
+  Quick-run (skip this wizard next time):
     ./convox-deploy-debug --rack production --app myapp
 
-  Run diagnostics now? [Y/n] y
+  Run specific checks only (-c, repeatable, combine as needed):
+    -c services    service instance logs and classification
+    -c overview    service rollout status and events
+    -c init        init container detection
 
->>> Starting diagnostics...
+    Example: ./convox-deploy-debug --rack production --app myapp -c overview -c services
+  ──────────────────────────────────────────────────────────────────────────
+
+  Run diagnostics now? [Y/n] y
 ```
 
 After you confirm, the tool runs the full diagnostics automatically. It also prints the equivalent CLI command so you can skip the wizard next time.
@@ -262,88 +304,86 @@ After you confirm, the tool runs the full diagnostics automatically. It also pri
 1. Parses CLI args, validates required flags (`--rack`, `--app`) and dependencies (`kubectl`, `python3`)
 2. If `--repo` or a URL-based `--convox-yml` is provided, fetches the manifest via curl to a temp file (cleaned up on exit)
 3. If a convox.yml is available (local or fetched), discovers service names using yq or grep fallback
-4. **Service rollout overview** -- queries all services in the app to show a per-service status summary (running, deploying, stalled), resource health, and deploy-level events (see [Service and Resource Overview](#service-and-resource-overview) below)
-5. Checks for pods stuck in `Init:` state and captures init container logs (all init containers, not just Convox's)
-6. Fetches all pods in the `<rack>-<app>` namespace as JSON via kubectl
-7. Parses pod JSON with an inline Python script to classify pods (unhealthy, not-ready, new, healthy)
-8. For each non-healthy pod (or all pods if `--all`): collects current logs, previous container logs, and Kubernetes events
-9. Renders output in the selected mode: terminal (full color), summary (table), or json
+4. **Service rollout overview** (`-c overview`) -- queries all services in the app to show a per-service status summary (running, deploying, stalled), resource health, and deploy-level events (see [Service and Resource Overview](#service-and-resource-overview) below)
+5. **Init container check** (`-c init`) -- checks for instances stuck in `Init:` state and captures init container logs (all init containers, not just Convox's)
+6. **Service instance diagnostics** (`-c services`) -- fetches all instances in the `<rack>-<app>` namespace as JSON, classifies them (unhealthy, not-ready, new, healthy), and collects current logs, previous crash logs, and cluster events for each non-healthy instance (or all instances if `--all`)
+7. Renders output in the selected mode: terminal (full color), summary (table), or json
 
 ## Service and Resource Overview
 
-Before diving into individual process logs, the script shows a high-level overview of your app's services and resources. This is the first thing you see and answers the question "what's actually happening with my deploy?"
+Before diving into individual service logs, the script shows a high-level overview of your app's services and resources. This is the first thing you see and answers the question "what's actually happening with my deploy?"
 
 ### Service Status
 
 Shows the rollout status of each service in your app:
 
 ```
-SERVICE STATUS
-------------------------------------------------------------------------------
-  web       1/1 processes ready                                    [RUNNING]
-  worker    0/1 processes ready                                    [STALLED]
-    Deploy timed out -- processes did not become healthy before the deadline
-    Tip: check process logs below for crash details or health check failures
-------------------------------------------------------------------------------
+  SERVICE STATUS
+  ──────────────────────────────────────────────────────────────────────────
+  ● web  1/1 instance ready  RUNNING
+  ● worker  0/1 instance ready  STALLED
+      Deploy timed out -- service instances did not become healthy before the deadline
+      Check service logs below for crash details or health check failures
+  ──────────────────────────────────────────────────────────────────────────
 ```
 
 Possible statuses:
 
 | Status | Meaning |
 |--------|---------|
-| **RUNNING** | All processes are up and healthy |
-| **DEPLOYING** | New processes are being rolled out |
-| **STALLED** | Deploy is stuck -- processes are not becoming healthy |
-| **SCALED DOWN** | Service has 0 desired processes |
+| **RUNNING** | All instances are up and healthy |
+| **DEPLOYING** | New instances are being rolled out |
+| **STALLED** | Deploy is stuck -- instances are not becoming healthy |
+| **SCALED DOWN** | Service has 0 desired instances |
 
-When a service has a port configured but no processes are passing health checks, you'll also see:
+When a service has a port configured but no instances are passing health checks, you'll also see:
 
 ```
-    Not receiving traffic -- no processes passing health checks yet
-    Check health.path in convox.yml matches a responding endpoint
+      Not receiving traffic -- no instances passing health checks yet
+      Check health.path in convox.yml matches a responding endpoint
 ```
 
-Agent-type services (one process per node) are labeled accordingly.
+Agent-type services (one instance per node) are labeled accordingly.
 
 ### Resource Status
 
 If your app uses containerized resources (postgres, redis, etc.), their health is shown:
 
 ```
-RESOURCE STATUS
-------------------------------------------------------------------------------
-  postgres    1/1 running                                              [OK]
-  redis       0/1 running                                           [DOWN]
-    Services depending on this resource may fail to connect
-------------------------------------------------------------------------------
+  RESOURCE STATUS
+  ──────────────────────────────────────────────────────────────────────────
+  ● postgres  1/1 running  OK
+  ● redis  0/1 running  DOWN
+      Services depending on this resource may fail to connect
+  ──────────────────────────────────────────────────────────────────────────
 ```
 
 This helps catch the common case where a service is failing because a backing resource is down, not because of a problem in your code.
 
 ### Service Events
 
-Warning-level events from the deploy infrastructure are shown when present. These are events you would not otherwise see in `convox logs` or in the per-process output:
+Warning-level events from the deploy infrastructure are shown when present. These are events you would not otherwise see in `convox logs` or in the per-instance output:
 
 ```
-SERVICE EVENTS
-------------------------------------------------------------------------------
-  worker  Could not create new processes
-    Error creating: pods "worker-abc-123" is forbidden: exceeded quota
-  worker  Failed to pull the container image -- check build output and registry access
-    Failed to pull image "myorg/worker:bad-tag": rpc error: code = NotFound
-------------------------------------------------------------------------------
+  SERVICE EVENTS
+  ──────────────────────────────────────────────────────────────────────────
+  ! worker  Could not create new service instances
+      Error creating: pods "worker-abc-123" is forbidden: exceeded quota
+  ! worker  Failed to pull the service image -- check build output and registry access
+      Failed to pull image "myorg/worker:bad-tag": rpc error: code = NotFound
+  ──────────────────────────────────────────────────────────────────────────
 ```
 
 Common events and what they mean:
 
 | Event | What to check |
 |-------|---------------|
-| Could not create new processes | Cluster may be out of capacity; check resource quotas |
-| Could not schedule process | Not enough CPU/memory in the cluster; adjust `scale.cpu` or `scale.memory` in convox.yml |
-| Failed to pull the container image | Build may have failed or image tag is wrong; check `convox builds` |
-| Process ran out of memory | Increase `scale.memory` in convox.yml |
-| Failed to mount volume | Check volume configuration in convox.yml |
-| Deploy timed out | Processes did not become healthy in time; check health check settings and process logs |
+| Could not create new service instances | Cluster may be out of capacity; check resource quotas |
+| Could not place service instance | Not enough CPU/memory in the cluster; adjust `scale.cpu` or `scale.memory` in convox.yml |
+| Failed to pull the service image | Build may have failed or image tag is wrong; check `convox builds` |
+| Service instance ran out of memory | Increase `scale.memory` in convox.yml |
+| Failed to mount volume | Check volumeOptions in convox.yml |
+| Deploy timed out | Instances did not become healthy in time; check health check settings and service logs |
 
 ### JSON output
 
@@ -403,7 +443,7 @@ A sample two-service app is included in `test-app/` for validating the debug too
 | Service | Behavior | Expected outcome |
 |---------|----------|-----------------|
 | **web** | Express app, returns 200 on `/health` | Comes up healthy, passes health checks |
-| **worker** | Express app, logs startup messages, then crashes after 3s with a simulated database connection error | Enters CrashLoopBackOff, never passes health checks |
+| **worker** | Express app, logs startup messages, then crashes after 3s with a simulated database connection error | Enters a crash loop, never passes health checks |
 
 ### Deploying the test app
 
@@ -421,7 +461,7 @@ convox deploy --rack <rack> --app test-debug
 In another terminal while the deploy is in progress (or after it stalls):
 
 ```bash
-# Easiest: interactive guided mode (picks rack, configures kubectl, picks app)
+# Easiest: interactive guided mode (picks rack, configures cluster access, picks app)
 ./convox-deploy-debug
 
 # With service discovery from convox.yml
@@ -430,85 +470,92 @@ In another terminal while the deploy is in progress (or after it stalls):
 # Summary mode for quick triage
 ./convox-deploy-debug -r <rack> -a test-debug -o summary
 
+# Just the rollout overview
+./convox-deploy-debug -r <rack> -a test-debug -c overview
+
 # JSON output
 ./convox-deploy-debug -r <rack> -a test-debug -o json | jq .
 ```
 
 ### Expected output (terminal mode)
 
-Below is representative output you should see after deploying the test app. The web service comes up healthy. The worker service crashes on startup and enters CrashLoopBackOff.
+Below is representative output you should see after deploying the test app. The web service comes up healthy. The worker service crashes on startup and enters a crash loop.
 
 ```
-SERVICE STATUS
-------------------------------------------------------------------------------
-  web       1/1 processes ready                                    [RUNNING]
-  worker    0/1 processes ready                                    [STALLED]
-    Deploy timed out -- processes did not become healthy before the deadline
-    Tip: check process logs below for crash details or health check failures
-------------------------------------------------------------------------------
+  SERVICE STATUS
+  ──────────────────────────────────────────────────────────────────────────
+  ● web  1/1 instance ready  RUNNING
+  ● worker  0/1 instance ready  STALLED
+      Deploy timed out -- service instances did not become healthy before the deadline
+      Check service logs below for crash details or health check failures
+  ──────────────────────────────────────────────────────────────────────────
 
-SERVICE EVENTS
-------------------------------------------------------------------------------
-  worker  Process is crash-looping on startup -- see logs below
-    Back-off restarting failed container worker in pod worker-6f8b9c-x4z2k
-------------------------------------------------------------------------------
+  SERVICE EVENTS
+  ──────────────────────────────────────────────────────────────────────────
+  ! worker  Service instance is crash-looping on startup -- see logs below
+      Back-off restarting failed container worker in pod worker-6f8b9c-x4z2k
+  ──────────────────────────────────────────────────────────────────────────
 
-CONVOX DEPLOY DEBUG  v1.2.0
-Rack: <rack>  App: test-debug  Namespace: <rack>-test-debug
-Time: 2026-03-16T12:00:00Z  Age threshold: 300s
-Target pods: 1
-------------------------------------------------------------------------------
+  CONVOX DEPLOY DEBUG  v1.2.0
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-[X] Pod 1/1: worker-6f8b9c-x4z2k
-    Service: worker  Phase: Running  Ready: false  Age: 45s  Restarts: 3
-    State: CrashLoopBackOff
+    Rack  <rack>    App  test-debug    namespace: <rack>-test-debug
+    Time  2026-03-16T12:00:00Z    Age threshold  300s    Instances  1
 
-    --- Events ---
-    2026-...  Warning  BackOff   Back-off restarting failed container worker...
-    2026-...  Warning  Unhealthy Readiness probe failed: HTTP probe failed...
+  ──────────────────────────────────────────────────────────────────────────
 
-    --- Logs (tail 200) ---
-    worker service starting up...
-    worker: connecting to database...
-    worker: running migrations...
-    worker service listening on port 4000 (will crash shortly)
-    worker: FATAL - failed to connect to database at DB_HOST:5432
-    worker: error: connection refused (ECONNREFUSED)
-    worker: shutting down
+  ● Instance 1/1  not-ready
+    name:    worker-6f8b9c-x4z2k
+    service: worker    state: Running    ready: false    age: 45s    restarts: 3
+    detail:  CrashLoopBackOff
 
-    --- Previous Container Logs (crashed) ---
-    worker service starting up...
-    worker: connecting to database...
-    worker: running migrations...
-    worker service listening on port 4000 (will crash shortly)
-    worker: FATAL - failed to connect to database at DB_HOST:5432
-    worker: error: connection refused (ECONNREFUSED)
-    worker: shutting down
-------------------------------------------------------------------------------
+    ─── cluster events ───
+      2026-...  Warning  BackOff   Back-off restarting failed container worker...
+      2026-...  Warning  Unhealthy Readiness probe failed: HTTP probe failed...
 
-Legend:  [X] Unhealthy  [!] Not Ready  [*] New  [+] Healthy
+    ─── service logs (last 200 lines) ───
+      worker service starting up...
+      worker: connecting to database...
+      worker: running migrations...
+      worker service listening on port 4000 (will crash shortly)
+      worker: FATAL - failed to connect to database at DB_HOST:5432
+      worker: error: connection refused (ECONNREFUSED)
+      worker: shutting down
+
+    ─── previous crash logs ───
+      worker service starting up...
+      worker: connecting to database...
+      worker: running migrations...
+      worker service listening on port 4000 (will crash shortly)
+      worker: FATAL - failed to connect to database at DB_HOST:5432
+      worker: error: connection refused (ECONNREFUSED)
+      worker: shutting down
+  ──────────────────────────────────────────────────────────────────────────
+
+  ● Unhealthy   ● Not Ready   ● New   ● Healthy
 ```
 
 ### Expected output (summary mode)
 
 ```
-SERVICE STATUS
-------------------------------------------------------------------------------
-  web       1/1 processes ready                                    [RUNNING]
-  worker    0/1 processes ready                                    [STALLED]
-    Deploy timed out -- processes did not become healthy before the deadline
-------------------------------------------------------------------------------
+  SERVICE STATUS
+  ──────────────────────────────────────────────────────────────────────────
+  ● web  1/1 instance ready  RUNNING
+  ● worker  0/1 instance ready  STALLED
+      Deploy timed out -- service instances did not become healthy before the deadline
+  ──────────────────────────────────────────────────────────────────────────
 
-Use terminal mode (-o terminal) for full process logs.
+  Use terminal mode (-o terminal) for full service logs.
 
-Deploy Debug Summary  <rack>/test-debug  2026-03-16T12:00:00Z
-------------------------------------------------------------------------------
-POD                                           SERVICE    STATUS       READY  RESTARTS DETAIL
-------------------------------------------------------------------------------
-worker-6f8b9c-x4z2k                          worker     Running(45s) false  3        CrashLoopBackOff
-------------------------------------------------------------------------------
+  Deploy Debug Summary  <rack>/test-debug  2026-03-16T12:00:00Z
+  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Use terminal mode (-o terminal) for full logs.
+  INSTANCE                                       SERVICE    STATUS       READY  RESTARTS DETAIL
+  ──────────────────────────────────────────────────────────────────────────
+  ● worker-6f8b9c-x4z2k                          worker     Running(45s) false  3        CrashLoopBackOff
+  ──────────────────────────────────────────────────────────────────────────
+
+  Use terminal mode (-o terminal) for full service logs.
 ```
 
 ### Expected output (JSON mode)
@@ -540,14 +587,14 @@ Use terminal mode (-o terminal) for full logs.
       "ready": 0,
       "available": 0,
       "status": "stalled",
-      "stallMessage": "Deploy timed out -- processes did not become healthy before the deadline",
+      "stallMessage": "Deploy timed out -- service instances did not become healthy before the deadline",
       "receivingTraffic": false,
       "events": [
         {
           "service": "worker",
           "time": "2026-03-16T12:00:00Z",
           "reason": "BackOff",
-          "message": "Process is crash-looping on startup -- see logs below",
+          "message": "Service instance is crash-looping on startup -- see logs below",
           "raw": "Back-off restarting failed container worker in pod worker-6f8b9c-x4z2k"
         }
       ]
@@ -576,9 +623,9 @@ Use terminal mode (-o terminal) for full logs.
 
 - **Service overview** -- Confirms the tool correctly identifies `web` as running and `worker` as stalled
 - **Traffic routing** -- Confirms the tool detects that `worker` is not receiving traffic
-- **Deploy events** -- Confirms the tool surfaces CrashLoopBackOff and health check failure events from the deployment infrastructure, not just from individual pods
+- **Deploy events** -- Confirms the tool surfaces crash loop and health check failure events from the deploy infrastructure, not just from individual instances
 - **Pre-healthcheck logs** -- The worker's startup output ("connecting to database...", "FATAL - failed to connect...") is captured even though `convox logs` would show nothing (health checks never pass)
-- **Previous container logs** -- Crash history from prior restart cycles is captured
-- **Pod classification** -- The worker pod is correctly classified as not-ready/unhealthy
+- **Previous crash logs** -- Crash history from prior restart cycles is captured
+- **Instance classification** -- The worker instance is correctly classified as not-ready
 - **All output modes** -- Terminal, summary, and JSON all render correctly
-
+- **Selective checks** -- You can run `./convox-deploy-debug -r <rack> -a test-debug -c overview` to get just the rollout status without the full logs
