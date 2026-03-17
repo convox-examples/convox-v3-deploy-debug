@@ -45,7 +45,6 @@ If you run the script with no arguments, it checks all of these and gives you pl
 
 ```
 convox-v3-deploy-debug                           # Interactive guided mode
-convox-v3-deploy-debug --setup                   # Same thing, explicit flag
 convox-v3-deploy-debug --rack <rack> --app <app> [OPTIONS]
 ```
 
